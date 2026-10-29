@@ -1,0 +1,143 @@
+--- a/src/ops/linear/gguf/gguf_linear.cpp
++++ b/src/ops/linear/gguf/gguf_linear.cpp
+@@ -4,6 +4,11 @@
+ #include "ops/linear/sm70/sm70_gemm.h"
+ 
+ #include <algorithm>
++#include <atomic>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <cstdint>
+ #include <stdexcept>
+ #include <string>
+ #include <vector>
+@@ -18,6 +23,35 @@
+ constexpr std::int32_t kDequantizedVectorColumns = 64;
+ // The widest stream-k fixup plane any launch can ask for: one 128 x 128 FP32 tile per SM.
+ constexpr std::size_t kFixupTileBytes = 128 * 128 * sizeof(float);
++
++// An experimental SM110a-only route for one measured dense format. The GGUF bytes remain
++// untouched; each selected call dequantizes bounded row slabs into the existing 16 MiB scratch.
++bool q6k_cublas_prefill_enabled() {
++#if defined(NINFER_SM110A_COMPAT)
++    static const bool enabled = [] {
++        const char* value = std::getenv("NINFER_GGUF_Q6K_CUBLAS_PREFILL");
++        return value != nullptr && std::strcmp(value, "1") == 0;
++    }();
++    return enabled;
++#else
++    return false;
++#endif
++}
++
++bool q6k_cublas_prefill_takes(gguf::GgmlType type, std::int32_t tokens) {
++    return q6k_cublas_prefill_enabled() && type == gguf::GgmlType::Q6_K &&
++           tokens > kDequantizedVectorColumns;
++}
++
++void log_q6k_cublas_prefill(std::int32_t rows, std::int32_t k, std::int32_t tokens) {
++    const char* value = std::getenv("NINFER_GGUF_Q6K_CUBLAS_PREFILL_LOG");
++    if (value == nullptr || std::strcmp(value, "1") != 0) { return; }
++    static std::atomic<std::uint64_t> calls{0};
++    const std::uint64_t call = calls.fetch_add(1, std::memory_order_relaxed) + 1;
++    std::fprintf(stderr,
++                 "[ninfer] q6k_dequant_cublas_prefill call=%llu rows=%d K=%d T=%d scratch_mib=16\n",
++                 static_cast<unsigned long long>(call), rows, k, tokens);
++}
+ 
+ std::int64_t row_bytes(const Weight& w) {
+     const auto block = gguf_block_shape(w.qtype);
+@@ -220,7 +254,7 @@
+             throw std::invalid_argument("gguf workspace: unsupported product geometry");
+         }
+         const auto type = gguf_type(shape.qtype);
+-        if (gguf::has_matrix_kernel(type)) {
++        if (gguf::has_matrix_kernel(type) && !q6k_cublas_prefill_takes(type, max_tokens)) {
+             const int layout = gguf::matrix_activation_layout(type);
+             if (std::find(layouts.begin(), layouts.end(), layout) == layouts.end()) {
+                 layouts.push_back(layout);
+@@ -309,7 +343,8 @@
+     bool dequantized        = false;
+     for (const auto& p : products) {
+         plane_rows = std::max(plane_rows, p.weight->n);
+-        dequantized |= !matrix_kernel(*p.weight);
++        const auto type = gguf_type(p.weight->qtype);
++        dequantized |= !matrix_kernel(*p.weight) || q6k_cublas_prefill_takes(type, t);
+     }
+     auto* plane = static_cast<float*>(
+         workspace.alloc_bytes(std::size_t(plane_rows) * t * sizeof(float)).data);
+@@ -328,7 +363,21 @@
+         const bool direct = p.f32 != nullptr && p.epilogue == GgufEpilogue::Store;
+         float* out        = direct ? p.f32 + p.row : plane;
+         const std::int64_t stride = direct ? p.f32_rows : w.n;
+-        if (gguf::has_matrix_kernel(type)) {
++        if (q6k_cublas_prefill_takes(type, t)) {
++            // The planner reserves one KxT gather: products execute in order on this stream, so
++            // each product may reuse that span after the previous GEMM has been enqueued.
++            auto q6k_product_scope = workspace.scope();
++            const __nv_bfloat16* source = xb;
++            if (w.input_columns != nullptr) {
++                auto* gathered = static_cast<__nv_bfloat16*>(
++                    workspace.alloc_bytes(std::size_t(k) * t * 2).data);
++                gguf::gather_columns(xb, k, t, w.input_columns, gathered, stream);
++                source = gathered;
++            }
++            log_q6k_cublas_prefill(w.n, k, t);
++            gguf::dequantized_product(type, w.qdata, row_bytes(w), w.n, k, source, t, out, stride,
++                                      scratch, kDequantizedScratchBytes, stream);
++        } else if (gguf::has_matrix_kernel(type)) {
+             const int layout = gguf::matrix_activation_layout(type);
+             auto found = std::find_if(activations.begin(), activations.end(), [&](const Activation& a) {
+                 return a.layout == layout && a.columns == w.input_columns;
+--- a/tests/ops/linear/test_gguf.cpp
++++ b/tests/ops/linear/test_gguf.cpp
+@@ -176,8 +176,12 @@
+ int run_type(const TypeCase& c, std::uint32_t seed, std::int32_t k) {
+     constexpr std::int32_t kRows = 256;
+     const std::int32_t kK        = k;
+-    const std::int32_t widths[]  = {1, 2, 3, 4, 5, 8, 9, 17, 40, 70, 130};
+-    const std::int32_t max_t     = 130;
++    std::vector<std::int32_t> widths{1, 2, 3, 4, 5, 8, 9, 17, 40, 70, 130};
++    if (c.qtype == QType::GGUF_Q6_K) {
++        widths.push_back(128);
++        widths.push_back(256);
++    }
++    const std::int32_t max_t = *std::max_element(widths.begin(), widths.end());
+     std::mt19937 rng(seed);
+     int failures = 0;
+ 
+@@ -227,6 +231,8 @@
+     columns_device.copy_from_host(columns.data(), columns.size() * sizeof(std::int32_t));
+     Weight gathered        = gate;
+     gathered.input_columns = static_cast<const std::int32_t*>(columns_device.p);
++    Weight gathered_up        = up;
++    gathered_up.input_columns = static_cast<const std::int32_t*>(columns_device.p);
+ 
+     const auto product = [&](std::int32_t row0, std::int32_t t, bool permuted) {
+         std::vector<double> out(std::size_t(kRows) * t);
+@@ -327,6 +333,24 @@
+         check(cudaDeviceSynchronize(), "linear_swiglu pair");
+         out_device.copy_to_host(host.data(), host.size() * sizeof(__nv_bfloat16));
+         failures += run_check("swiglu pair T=" + std::to_string(t), to_float(host), swiglu);
++
++        if (c.qtype == QType::GGUF_Q6_K) {
++            // Both paired Q6_K products gather the same permuted input in one gguf_project() call.
++            // This catches workspace planning that budgets one gather but accumulates two allocations.
++            ops::linear_swiglu(x, gathered, gathered_up, out, ops::LinearPolicy::A16Only, workspace,
++                               nullptr);
++            check(cudaDeviceSynchronize(), "gathered linear_swiglu pair");
++            out_device.copy_to_host(host.data(), host.size() * sizeof(__nv_bfloat16));
++            const auto gathered_gate = product(0, t, true);
++            const auto gathered_upper = product(kRows, t, true);
++            std::vector<double> gathered_swiglu(plain.size());
++            for (std::size_t i = 0; i < gathered_swiglu.size(); ++i) {
++                gathered_swiglu[i] = gathered_gate[i] / (1.0 + std::exp(-gathered_gate[i])) *
++                                     gathered_upper[i];
++            }
++            failures += run_check("swiglu gathered pair T=" + std::to_string(t), to_float(host),
++                                  gathered_swiglu);
++        }
+     }
+     // The planned capacity covers every call; the slack above it only keeps a shortfall from
+     // aborting the numerical checks before this one reports it.

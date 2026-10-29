@@ -1,0 +1,22 @@
+diff --git a/src/ops/linear/gguf/ggml_bridge_vec.cuh b/src/ops/linear/gguf/ggml_bridge_vec.cuh
+--- a/src/ops/linear/gguf/ggml_bridge_vec.cuh
++++ b/src/ops/linear/gguf/ggml_bridge_vec.cuh
+@@ -13,4 +13,5 @@
+ #include "../../common/fixed_point.cuh"
+ 
+ #include <algorithm>
++#include <cstdlib>
+ #include <type_traits>
+@@ -1589,2 +1590,12 @@ void moe_decode_down_chunk(const MoeDecodeDownArgs& args, cudaStream_t stream) {
+ void moe_decode_down_chunk(const MoeDecodeDownArgs& args, cudaStream_t stream) {
++#if defined(NINFER_IQ4NL_DOWN_WARP_ROW_CANDIDATE)
++    if constexpr (type == GGML_TYPE_IQ4_NL && T == 4) {
++        extern void launch_iq4nl_decode_down_warp_row(const MoeDecodeDownArgs&, cudaStream_t);
++        if (args.records != nullptr && args.qs != nullptr && args.ds != nullptr &&
++            args.y == nullptr && std::getenv("NINFER_IQ4NL_DOWN_WARP_ROW") != nullptr) {
++            launch_iq4nl_decode_down_warp_row(args, stream);
++            return;
++        }
++    }
++#endif
+     if (T == 1 && args.records != nullptr && args.y == nullptr) {

@@ -1,0 +1,54 @@
+--- a/src/ops/linear/gguf/ggml_bridge.cu
++++ b/src/ops/linear/gguf/ggml_bridge.cu
+@@ -42,6 +42,7 @@
+ 
+ namespace ninfer::ops::gguf {
+ namespace detail {
++void launch_iq4nl_prepared_slot_t1(const MoeDecodeDownArgs&, cudaStream_t);
+ 
+ const DeviceFacts& device_facts() {
+     static std::array<DeviceFacts, 16> facts{};
+@@ -729,6 +730,26 @@
+         args.fixed == nullptr || (args.y != nullptr && args.counter == nullptr) ||
+         (args.ids_b != nullptr && args.table_b == nullptr)) {
+         throw std::invalid_argument("gguf moe decode: invalid down arguments");
++    }
++    // T077: compare the existing prepared expert-parallel T1 kernel with the row-major route.
++    // Opt-in only; quantized weights, prepared activations and fixed-point arithmetic are unchanged.
++    static const bool slot_parallel_t1 = [] {
++        const char* value = std::getenv("NINFER_THOR_IQ4NL_T1_SLOT_PARALLEL");
++        return value && value[0] == '1' && value[1] == '\0';
++    }();
++    if (slot_parallel_t1 && type == GgmlType::IQ4_NL && args.rows == 2560 &&
++        args.tokens == 1 && args.slots == 10 && args.per_token == 10 && args.row_bytes == 360 &&
++        args.records && args.qs && args.ds && args.fixed && args.y == nullptr) {
++        const auto& facts = detail::device_facts();
++        if (facts.cc == 1100 && facts.sm_count == 14) {
++            static const bool dispatch_logged = [] {
++                std::fprintf(stderr, "IQ4NL_T1_SLOT_PARALLEL dispatch: SM110/14SM rows2560 K640 top10 prepared\n");
++                return true;
++            }();
++            (void)dispatch_logged;
++            detail::launch_iq4nl_prepared_slot_t1(args, stream);
++            return;
++        }
+     }
+ #if defined(NINFER_THOR_IQ4NL_ROWOWNED)
+     // Cached opt-in; the default stays on the established production route. A non-matching
+--- a/src/ops/linear/gguf/ggml_vec_iq4_nl.cu
++++ b/src/ops/linear/gguf/ggml_vec_iq4_nl.cu
+@@ -2,3 +2,14 @@
+ #include "ggml_bridge_vec.cuh"
+ 
+ NINFER_GGUF_VECTOR_INSTANCE(GGML_TYPE_IQ4_NL);
++
++// T077 opt-in wrapper: reuse the existing kernel in its dedicated quantization unit.
++namespace ninfer::ops::gguf::detail {
++void launch_iq4nl_prepared_slot_t1(const MoeDecodeDownArgs& args, cudaStream_t stream) {
++    const int per_block = 2 * kVecWarps * vec::kDecodeRowPasses;
++    const int groups = (args.rows + per_block - 1) / per_block;
++    vec::moe_decode_down_kernel<GGML_TYPE_IQ4_NL, 1>
++        <<<dim3(groups, args.slots, 1), kVecWarps * 32, 0, stream>>>(args);
++    check(cudaGetLastError(), "IQ4NL T1 prepared slot-parallel down launch");
++}
++}

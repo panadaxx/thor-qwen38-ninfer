@@ -1,0 +1,629 @@
+diff --git a/bench/README.md b/bench/README.md
+index 279392d3..1cd2570e 100644
+--- a/bench/README.md
++++ b/bench/README.md
+@@ -167,7 +167,7 @@ matching test, phase, and roof it reports the measured time change and the fract
+ the pre-change gap to the roof that the change closed; a negative value moved the run
+ away from the roof. A baseline already at or above a roof reports `n/a` for that roof's
+ gap closure. Tests or phases present in only one run are listed as unmatched.
+-The tool requires schema v16, v17 or v18 and `--spec none`. It rejects speculative runs because proposals,
++The tool requires schema v16 through v19 and `--spec none`. It rejects speculative runs because proposals,
+ verification, and acceptance make output tokens an invalid proxy for executed model work.
+ 
+ Projection compute work is counted as `2 * matrix elements` for each executed text projection.
+@@ -1260,7 +1260,7 @@ closed.
+ 
+ Table, JSON, and CSV reports identify the architecture, model instance, artifact, Engine configuration,
+ load summary, memory capacity, KV payload, workspace peak, phase throughput, and speculative
+-statistics. JSON schema version 18 records the public value objects directly:
++statistics. JSON schema version 19 records the public value objects directly:
+ 
+ - `load`: architecture, public name, actual formats, prefill signature, load/upload time,
+   file/H2D/staging bytes and Device/Host object counts;
+diff --git a/bench/inference/ninfer_bench.cpp b/bench/inference/ninfer_bench.cpp
+index b1646d2a..0042999b 100644
+--- a/bench/inference/ninfer_bench.cpp
++++ b/bench/inference/ninfer_bench.cpp
+@@ -148,23 +148,25 @@ int main(int argc, char** argv) {
+             tests, options.max_context, options.speculative, options.use_cuda_graph);
+ 
+         ninfer::EngineOptions engine_options;
+-        engine_options.artifact_path = options.artifact_path;
+-        engine_options.device        = options.device;
+-        engine_options.max_context   = max_context;
++        engine_options.artifact_path    = options.artifact_path;
++        engine_options.device           = options.device;
++        engine_options.max_context      = max_context;
+         engine_options.rope_yarn_factor = options.rope_yarn_factor;
+-        engine_options.kv_capacity   = ninfer::KvCapacityPolicy::explicit_capacity(max_context);
+-        engine_options.prefill_chunk = options.prefill_chunk;
++        engine_options.kv_capacity      = ninfer::KvCapacityPolicy::explicit_capacity(max_context);
++        engine_options.prefill_chunk    = options.prefill_chunk;
+         engine_options.fast_prefill_kernel        = options.fast_prefill_kernel;
+-        engine_options.kv_cache      = options.kv_cache;
+-        engine_options.context_cache.enabled = false;
+-        engine_options.speculative           = options.speculative;
+-        engine_options.use_cuda_graph        = options.use_cuda_graph;
+-        engine_options.prefill_a8            = options.prefill_a8;
+-        engine_options.prefill_cublas        = options.prefill_cublas;
++        engine_options.kv_cache                   = options.kv_cache;
++        engine_options.context_cache.enabled      = false;
++        engine_options.speculative                = options.speculative;
++        engine_options.use_cuda_graph             = options.use_cuda_graph;
++        engine_options.prefill_a8                 = options.prefill_a8;
++        engine_options.prefill_cublas             = options.prefill_cublas;
+         engine_options.prefill_cublas_projections = options.prefill_cublas_projections;
+-        engine_options.expert_residency      = options.expert_residency;
+-        engine_options.expert_cache_bytes    = options.expert_cache_bytes;
+-        engine_options.hybrid_experts        = options.hybrid_experts;
++        engine_options.expert_residency           = options.expert_residency;
++        engine_options.expert_cache_bytes         = options.expert_cache_bytes;
++        engine_options.hybrid_experts             = options.hybrid_experts;
++        engine_options.device_profile             = options.device_profile;
++        engine_options.device_profile_path        = options.device_profile_path;
+ 
+         ninfer::bench::BenchEnvironment env;
+         env.artifact_path            = options.artifact_path;
+@@ -176,6 +178,8 @@ int main(int argc, char** argv) {
+         env.kv_cache                 = options.kv_cache;
+         env.speculative              = options.speculative;
+         env.use_cuda_graph           = options.use_cuda_graph;
++        env.device_profile           = options.device_profile;
++        env.device_profile_path      = options.device_profile_path;
+         env.repetitions              = options.repetitions;
+         env.warmup                   = options.warmup;
+         env.corpus_path              = options.corpus_path;
+@@ -190,8 +194,8 @@ int main(int argc, char** argv) {
+                   << ", kv_cache=" << ninfer::bench::kv_cache_name(options.kv_cache) << ")\n";
+         ninfer::Engine engine(std::move(engine_options));
+         fill_cuda_environment(env, options.device);
+-        env.load   = engine.load_summary();
+-        env.memory = engine.memory_summary();
++        env.load          = engine.load_summary();
++        env.memory        = engine.memory_summary();
+         env.prefill_chunk = engine.options().prefill_chunk;
+ 
+         prime_decode_graph(engine, env, corpus);
+diff --git a/bench/inference/ninfer_bench_support.cpp b/bench/inference/ninfer_bench_support.cpp
+index 8d62fd75..7996806b 100644
+--- a/bench/inference/ninfer_bench_support.cpp
++++ b/bench/inference/ninfer_bench_support.cpp
+@@ -270,7 +270,8 @@ void append_speculative_json(std::ostringstream& out, const SpeculativeStats& st
+ void append_timings_json(std::ostringstream& out, const GenerationTimings& timings,
+                          std::string_view indent) {
+     out << indent << "\"timings\": {" << "\"prepare_seconds\": " << number(timings.prepare_seconds)
+-        << ", " << "\"vision_seconds\": " << number(timings.vision_seconds) << ", "
++        << ", " << "\"ttft_seconds\": " << number(timings.first_token_seconds) << ", "
++        << "\"vision_seconds\": " << number(timings.vision_seconds) << ", "
+         << "\"prefill_seconds\": " << number(timings.prefill_seconds) << ", "
+         << "\"decode_seconds\": " << number(timings.decode_seconds) << ", "
+         << "\"total_seconds\": " << number(timings.total_seconds) << '}';
+@@ -297,7 +298,8 @@ std::string usage_text(std::string_view program) {
+     std::ostringstream out;
+     out << "Usage: " << program << " --weights <artifact.ninfer> [options]\n\n"
+         << "Product-route throughput benchmark over ninfer::Engine. pp measures Engine prefill;\n"
+-        << "tg measures G generated tokens after an untimed one-token seed prefill.\n\n"
++        << "tg measures G decode steps after an untimed one-token seed prefill (G+1 actual output "
++           "tokens).\n\n"
+         << "Options:\n"
+         << "  --weights <path>            required .ninfer artifact\n"
+         << "  --corpus <path>             token-id corpus (default: " << kDefaultCorpusPath << ")\n"
+@@ -316,10 +318,13 @@ std::string usage_text(std::string_view program) {
+         << "  --expert-residency <device|host|disk>  routed MoE experts on the GPU (default), in "
+            "pinned host memory, or in the artifact files\n"
+         << "  --expert-cache-mib <N|auto> persistent device expert cache (default: auto)\n"
+-        << "  --expert-dma-share <F|auto> host or disk experts: the GPU's share of a decode call's\n"
+-           "                              cache misses, the CPU computing the rest (default: auto)\n"
++        << "  --expert-dma-share <F|auto> host or disk experts: the GPU's share of a decode "
++           "call's\n"
++           "                              cache misses, the CPU computing the rest (default: "
++           "auto)\n"
+         << "  --expert-cpu-threads <N>    host or disk experts: CPU workers (default: automatic)\n"
+-        << "  --kv-dtype <bf16|int8|fp8|rk8v4|rk4v4|rk4v4-e8|rk2v4-e8|nvfp4|k8v4>  KV cache storage "
++        << "  --kv-dtype <bf16|int8|fp8|rk8v4|rk4v4|rk4v4-e8|rk2v4-e8|nvfp4|k8v4>  KV cache "
++           "storage "
+            "(default: bf16)\n"
+         << "  --fast-prefill-kernel       fast INT8-KV prompt kernel, wave-aligned chunks\n"
+         << "  --spec <mtp|dflash|dflash2> speculative backend (default: none)\n"
+@@ -334,11 +339,16 @@ std::string usage_text(std::string_view program) {
+         << "  --device <id>               CUDA device ordinal (default: 0)\n"
+         << "  --no-cuda-graph             use eager decode\n"
+         << "  --no-prefill-a8             full prefill tiles keep their A16 routes\n"
+-        << "  --prefill-cublas            hand wide prefill GEMMs to cuBLAS (quality trade; wants a "
++        << "  --prefill-cublas            hand wide prefill GEMMs to cuBLAS (quality trade; wants "
++           "a "
+            "larger --prefill-chunk)\n"
+-        << "  --no-prefill-cublas-projections  keep attention/GDN input projections off that route\n"
+-        << "  --lookup-ngram <n>          context-lookup drafting from the last n tokens (0 = off)\n"
++        << "  --no-prefill-cublas-projections  keep attention/GDN input projections off that "
++           "route\n"
++        << "  --lookup-ngram <n>          context-lookup drafting from the last n tokens (0 = "
++           "off)\n"
+         << "  --profile-measured          bracket one measured repetition with CUDA profiler API\n"
++        << "  --device-profile off|auto|calibrate  route profile mode (default: off)\n"
++        << "  --device-profile-path FILE  explicit profile file; required unless mode is off\n"
+         << "  -o, --output <table|json|csv>  output format (default: table)\n"
+         << "  --output-file <path>        write report to a file\n"
+         << "  -h, --help                  show this help\n\n"
+@@ -444,6 +454,17 @@ BenchOptions parse_args(int argc, char** argv) {
+             options.use_cuda_graph = false;
+         } else if (arg == "--profile-measured") {
+             options.profile_measured = true;
++        } else if (arg == "--device-profile") {
++            options.device_profile = value("--device-profile");
++            if (options.device_profile != "off" && options.device_profile != "auto" &&
++                options.device_profile != "calibrate") {
++                throw std::invalid_argument("--device-profile must be off, auto or calibrate");
++            }
++        } else if (arg == "--device-profile-path") {
++            options.device_profile_path = value("--device-profile-path");
++            if (options.device_profile_path.empty()) {
++                throw std::invalid_argument("--device-profile-path must not be empty");
++            }
+         } else if (arg == "-o" || arg == "--output") {
+             const std::string selected = value("--output");
+             if (selected == "table") {
+@@ -462,6 +483,10 @@ BenchOptions parse_args(int argc, char** argv) {
+         }
+     }
+     if (!saw_artifact) { throw std::invalid_argument("--weights is required"); }
++    if (options.device_profile != "off" && options.device_profile_path.empty()) {
++        throw std::invalid_argument("--device-profile auto|calibrate requires "
++                                    "--device-profile-path to avoid an implicit user-cache write");
++    }
+     if (options.prefill_chunk % kPrefillChunkAlignment != 0) {
+         throw std::invalid_argument("--prefill-chunk must be a multiple of 128");
+     }
+@@ -650,6 +675,10 @@ std::vector<double> total_time_series(const TestResult& result) {
+     return timing_series<&GenerationTimings::total_seconds>(result);
+ }
+ 
++std::vector<double> ttft_time_series(const TestResult& result) {
++    return timing_series<&GenerationTimings::first_token_seconds>(result);
++}
++
+ std::string format_table(const BenchEnvironment& env, const std::vector<TestResult>& results) {
+     std::ostringstream out;
+     out << "ninfer_bench product throughput report\n"
+@@ -685,16 +714,20 @@ std::string format_table(const BenchEnvironment& env, const std::vector<TestResu
+         << " ngram_min_match=" << env.speculative.ngram_min_match
+         << " proposal_head=" << proposal_head_name(env.speculative.proposal_head)
+         << " decode_path=" << decode_path_name(env.use_cuda_graph, env.speculative)
++        << " device_profile=" << env.device_profile
++        << (env.device_profile_path.empty() ? "" : " profile_path=" + env.device_profile_path)
++        << " prefix_reuse=off"
+         << " graph_prime="
+         << (env.decode_graph_primed
+                 ? std::to_string(env.decode_graph_prime_output_tokens) + " outputs"
+                 : "n/a")
+         << " repetitions=" << env.repetitions << " warmup=" << env.warmup << "\n\n";
+ 
+-    constexpr std::size_t cols                   = 10;
++    constexpr std::size_t cols                   = 12;
+     const std::array<std::string, cols> headings = {
+-        "test",           "n_prompt", "n_gen",         "prefill t/s",           "decode out t/s",
+-        "decode eng t/s", "spec acc", "spec round/fb", "ngram acc/draft/round", "work peak"};
++        "test",        "fresh prompt",   "decode steps",          "output tok",
++        "prefill t/s", "decode out t/s", "decode eng t/s",        "TTFT s",
++        "spec acc",    "spec round/fb",  "ngram acc/draft/round", "work peak"};
+     std::vector<std::array<std::string, cols>> rows;
+     for (const TestResult& result : results) {
+         const SpeculativeStats spec  = aggregate_speculative(result);
+@@ -705,10 +738,15 @@ std::string format_table(const BenchEnvironment& env, const std::vector<TestResu
+         const std::string rounds =
+             spec.enabled ? std::to_string(spec.rounds) + "/" + std::to_string(spec.fallback_steps)
+                          : "n/a";
+-        rows.push_back({result.test.label, std::to_string(result.test.n_prompt),
+-                        std::to_string(result.test.n_gen), rate_cell(prefill_tok_s_series(result)),
++        rows.push_back({result.test.label,
++                        std::to_string(result.test.kind == TestKind::Decode ? kDecodeSeedTokens
++                                                                            : result.test.n_prompt),
++                        std::to_string(result.test.n_gen),
++                        std::to_string(result.test.requested_output_tokens()),
++                        rate_cell(prefill_tok_s_series(result)),
+                         rate_cell(decode_output_tok_s_series(result)),
+-                        rate_cell(decode_engine_tok_s_series(result)), acceptance, rounds,
++                        rate_cell(decode_engine_tok_s_series(result)),
++                        rate_cell(ttft_time_series(result)), acceptance, rounds,
+                         std::to_string(spec.ngram_accepted_tokens) + "/" +
+                             std::to_string(spec.ngram_drafted_tokens) + "/" +
+                             std::to_string(spec.ngram_rounds),
+@@ -809,6 +847,9 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
+         << "    \"expert_hits\": " << env.experts.hits << ",\n"
+         << "    \"expert_admissions\": " << env.experts.admitted << ",\n"
+         << "    \"expert_transferred_bytes\": " << env.experts.transferred_bytes << ",\n"
++        << "    \"device_profile\": \"" << json_escape(env.device_profile) << "\",\n"
++        << "    \"device_profile_path\": \"" << json_escape(env.device_profile_path) << "\",\n"
++        << "    \"prefix_reuse_enabled\": false,\n"
+         << "    \"speculative_backend\": \""
+         << product::speculative_backend_name(env.speculative.backend) << "\",\n"
+         << "    \"draft_tokens\": " << env.speculative.draft_tokens << ",\n"
+@@ -836,6 +877,9 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
+             << "      \"kind\": \"" << kind_string(result.test.kind) << "\",\n"
+             << "      \"n_prompt\": " << result.test.n_prompt << ",\n"
+             << "      \"n_gen\": " << result.test.n_gen << ",\n"
++            << "      \"fresh_prompt_tokens\": "
++            << (result.test.kind == TestKind::Decode ? kDecodeSeedTokens : result.test.n_prompt)
++            << ",\n"
+             << "      \"requested_output_tokens\": " << result.test.requested_output_tokens()
+             << ",\n";
+         append_stat(out, "prefill_tok_s", prefill_tok_s_series(result), "      ");
+@@ -891,7 +935,8 @@ std::string csv_field(std::string_view value) {
+ 
+ std::string format_csv(const BenchEnvironment& env, const std::vector<TestResult>& results) {
+     std::ostringstream out;
+-    out << "label,kind,n_prompt,n_gen,architecture,prefill_signature,model_name,artifact_path,max_"
++    out << "label,kind,n_prompt,fresh_prompt_tokens,n_gen,actual_output_tokens,architecture,"
++           "prefill_signature,model_name,artifact_path,max_"
+            "context,rope_yarn_factor,prefill_chunk,"
+            "speculative_"
+            "backend,draft_tokens,ngram_draft_tokens,ngram_min_match,"
+@@ -904,7 +949,8 @@ std::string format_csv(const BenchEnvironment& env, const std::vector<TestResult
+            "ngram_rounds,ngram_drafted_tokens,ngram_accepted_tokens,"
+            "repetitions,prefill_tok_s_mean,prefill_tok_s_stddev,decode_output_tok_s_mean,"
+            "decode_output_tok_s_stddev,decode_engine_tok_s_mean,decode_engine_tok_s_stddev,"
+-           "prepare_seconds_mean,prefill_seconds_mean,decode_seconds_mean,total_seconds_mean\n";
++           "prepare_seconds_mean,ttft_seconds_mean,prefill_seconds_mean,decode_seconds_mean,total_"
++           "seconds_mean\n";
+     const auto mean = [](const std::vector<double>& values) {
+         return values.empty() ? std::string() : number(compute_stats(values).mean);
+     };
+@@ -918,11 +964,13 @@ std::string format_csv(const BenchEnvironment& env, const std::vector<TestResult
+                                            : number(static_cast<double>(spec.accepted_tokens) /
+                                                     static_cast<double>(spec.drafted_tokens));
+         out << result.test.label << ',' << kind_string(result.test.kind) << ','
+-            << result.test.n_prompt << ',' << result.test.n_gen << ',' << env.load.architecture
+-            << ',' << env.load.prefill_signature << ',' << csv_field(env.load.model_name) << ','
+-            << csv_field(env.artifact_path) << ',' << env.max_context << ','
+-            << env.rope_yarn_factor << ',' << env.prefill_chunk
+-            << ',' << product::speculative_backend_name(env.speculative.backend) << ','
++            << result.test.n_prompt << ','
++            << (result.test.kind == TestKind::Decode ? kDecodeSeedTokens : result.test.n_prompt)
++            << ',' << result.test.n_gen << ',' << result.test.requested_output_tokens() << ','
++            << env.load.architecture << ',' << env.load.prefill_signature << ','
++            << csv_field(env.load.model_name) << ',' << csv_field(env.artifact_path) << ','
++            << env.max_context << ',' << env.rope_yarn_factor << ',' << env.prefill_chunk << ','
++            << product::speculative_backend_name(env.speculative.backend) << ','
+             << env.speculative.draft_tokens << ',' << env.speculative.ngram_draft_tokens << ','
+             << env.speculative.ngram_min_match << ','
+             << proposal_head_name(env.speculative.proposal_head) << ','
+@@ -948,8 +996,9 @@ std::string format_csv(const BenchEnvironment& env, const std::vector<TestResult
+             << stddev(decode_output_tok_s_series(result)) << ','
+             << mean(decode_engine_tok_s_series(result)) << ','
+             << stddev(decode_engine_tok_s_series(result)) << ','
+-            << mean(prepare_time_series(result)) << ',' << mean(prefill_time_series(result)) << ','
+-            << mean(decode_time_series(result)) << ',' << mean(total_time_series(result)) << '\n';
++            << mean(prepare_time_series(result)) << ',' << mean(ttft_time_series(result)) << ','
++            << mean(prefill_time_series(result)) << ',' << mean(decode_time_series(result)) << ','
++            << mean(total_time_series(result)) << '\n';
+     }
+     return out.str();
+ }
+@@ -989,9 +1038,12 @@ std::string json_escape(std::string_view value) {
+ 
+ std::string expert_residency_name(ExpertResidency residency) {
+     switch (residency) {
+-    case ExpertResidency::Device: return "device";
+-    case ExpertResidency::Host: return "host";
+-    case ExpertResidency::Disk: return "disk";
++    case ExpertResidency::Device:
++        return "device";
++    case ExpertResidency::Host:
++        return "host";
++    case ExpertResidency::Disk:
++        return "disk";
+     }
+     return "unknown";
+ }
+diff --git a/bench/inference/ninfer_bench_support.h b/bench/inference/ninfer_bench_support.h
+index 02b2a4b6..0f815728 100644
+--- a/bench/inference/ninfer_bench_support.h
++++ b/bench/inference/ninfer_bench_support.h
+@@ -21,7 +21,7 @@
+ 
+ namespace ninfer::bench {
+ 
+-inline constexpr int kSchemaVersion                   = 18;
++inline constexpr int kSchemaVersion                   = 19;
+ inline constexpr std::string_view kArtifactType       = "ninfer_bench_report";
+ inline constexpr std::string_view kDefaultCorpusPath  = "bench/fixtures/bench_corpus.ids";
+ inline constexpr int kDecodeSeedTokens                = 1;
+@@ -74,13 +74,17 @@ struct BenchOptions {
+     ExpertResidency expert_residency = ExpertResidency::Device;
+     std::optional<std::uint64_t> expert_cache_bytes;
+     HybridExpertOptions hybrid_experts; // --expert-dma-share, --expert-cpu-threads
+-    int device            = 0;
+-    bool use_cuda_graph   = true;
+-    bool prefill_a8       = true;
+-    bool prefill_cublas   = false;
++    int device                      = 0;
++    bool use_cuda_graph             = true;
++    bool prefill_a8                 = true;
++    bool prefill_cublas             = false;
+     bool prefill_cublas_projections = true;
+-    bool profile_measured = false;
+-    OutputFormat output   = OutputFormat::Table;
++    bool profile_measured           = false;
++    // Benchmarks never calibrate implicitly: calibration consumes GPU time and persists a route
++    // profile. Enabling it requires an explicit output path.
++    std::string device_profile = "off";
++    std::string device_profile_path;
++    OutputFormat output = OutputFormat::Table;
+     std::string output_file;
+     bool help_requested = false;
+ };
+@@ -127,8 +131,10 @@ struct BenchEnvironment {
+     bool use_cuda_graph                            = true;
+     bool decode_graph_primed                       = false;
+     std::uint32_t decode_graph_prime_output_tokens = 0;
+-    int repetitions                                = 0;
+-    int warmup                                     = 0;
++    std::string device_profile                     = "off";
++    std::string device_profile_path;
++    int repetitions = 0;
++    int warmup      = 0;
+     std::string corpus_path;
+     std::size_t corpus_tokens = 0;
+ };
+diff --git a/tests/test_ninfer_bench_support.cpp b/tests/test_ninfer_bench_support.cpp
+index d619f1a7..8417e5a3 100644
+--- a/tests/test_ninfer_bench_support.cpp
++++ b/tests/test_ninfer_bench_support.cpp
+@@ -88,6 +88,10 @@ int test_cli_contract() {
+         "--lm-head-draft",
+         "--device",
+         "1",
++        "--device-profile",
++        "auto",
++        "--device-profile-path",
++        "/tmp/ninfer-profile.json",
+         "--no-cuda-graph",
+         "--profile-measured",
+         "--output",
+@@ -109,11 +113,32 @@ int test_cli_contract() {
+     failures += expect(parsed.speculative.proposal_head == ninfer::ProposalHead::Optimized,
+                        "optimized proposal head");
+     failures += expect(parsed.device == 1 && !parsed.use_cuda_graph, "device and graph settings");
++    failures += expect_string(parsed.device_profile, "auto", "device profile mode");
++    failures += expect_string(parsed.device_profile_path, "/tmp/ninfer-profile.json",
++                              "device profile path");
+     failures += expect(parsed.profile_measured, "profile-measured flag");
+     failures +=
+         expect(parsed.output == qb::OutputFormat::Json && parsed.output_file == "report.json",
+                "output settings");
+ 
++    const auto safe_default = parse_for_test({"ninfer_bench", "--weights", "model.ninfer"});
++    failures += expect_string(safe_default.device_profile, "off",
++                              "benchmark disables automatic route calibration by default");
++    failures += expect(safe_default.device_profile_path.empty(),
++                       "safe default has no implicit profile path");
++    failures += expect_throws<std::invalid_argument>(
++        [&] {
++            (void)parse_for_test(
++                {"ninfer_bench", "--weights", "model.ninfer", "--device-profile", "auto"});
++        },
++        "calibrating benchmark requires explicit profile path");
++    failures += expect_throws<std::invalid_argument>(
++        [&] {
++            (void)parse_for_test({"ninfer_bench", "--weights", "model.ninfer", "--device-profile",
++                                  "invalid", "--device-profile-path", "/tmp/profile.json"});
++        },
++        "unknown device profile mode");
++
+     for (const auto k : {1U, 7U, 15U}) {
+         const auto dflash2 =
+             parse_for_test({"ninfer_bench", "--weights", "model.ninfer", "--spec", "dflash2",
+@@ -185,7 +210,8 @@ int test_cli_contract() {
+         failures += expect(yarn.rope_yarn_factor == std::stof(factor) && !yarn.max_context,
+                            "YaRN preserves factor without overriding benchmark auto-context");
+     }
+-    for (const auto* factor : {"0", "0.99", "4.01", "-1", "nan", "inf", "-inf", "1e999", "2x", ""}) {
++    for (const auto* factor :
++         {"0", "0.99", "4.01", "-1", "nan", "inf", "-inf", "1e999", "2x", ""}) {
+         failures += expect_throws<std::invalid_argument>(
+             [&] {
+                 (void)parse_for_test(
+@@ -199,8 +225,9 @@ int test_cli_contract() {
+                 {"ninfer_bench", "--weights", "model.ninfer", "--rope-yarn-factor"});
+         },
+         "missing benchmark YaRN factor");
+-    failures += expect(qb::usage_text("ninfer_bench").find("--rope-yarn-factor") != std::string::npos,
+-                       "benchmark help includes YaRN");
++    failures +=
++        expect(qb::usage_text("ninfer_bench").find("--rope-yarn-factor") != std::string::npos,
++               "benchmark help includes YaRN");
+     failures += expect(qb::usage_text("ninfer_bench").find("artifact.ninfer") != std::string::npos,
+                        "help names native artifact");
+     failures += expect(parse_for_test({"ninfer_bench", "--help"}).help_requested, "help flag");
+@@ -237,18 +264,19 @@ int test_cli_contract() {
+                        "benchmark help omits new KV modes");
+     const qb::BenchOptions route_defaults =
+         parse_for_test({"ninfer_bench", "--weights", "model.ninfer"});
+-    failures += expect(!route_defaults.prefill_cublas && route_defaults.prefill_cublas_projections &&
+-                           route_defaults.speculative.lookup_ngram == 0,
+-                       "cuBLAS prefill or context lookup on by default");
+-    const qb::BenchOptions route =
+-        parse_for_test({"ninfer_bench", "--weights", "model.ninfer", "--spec", "mtp",
+-                        "--draft-tokens", "3", "--lookup-ngram", "5", "--prefill-cublas",
+-                        "--no-prefill-cublas-projections"});
++    failures +=
++        expect(!route_defaults.prefill_cublas && route_defaults.prefill_cublas_projections &&
++                   route_defaults.speculative.lookup_ngram == 0,
++               "cuBLAS prefill or context lookup on by default");
++    const qb::BenchOptions route = parse_for_test(
++        {"ninfer_bench", "--weights", "model.ninfer", "--spec", "mtp", "--draft-tokens", "3",
++         "--lookup-ngram", "5", "--prefill-cublas", "--no-prefill-cublas-projections"});
+     failures += expect(route.prefill_cublas && !route.prefill_cublas_projections &&
+                            route.speculative.lookup_ngram == 5 &&
+                            route.speculative.backend == ninfer::SpeculativeBackend::Mtp,
+                        "benchmark cuBLAS prefill and context-lookup controls");
+-    for (const char* flag : {"--prefill-cublas", "--no-prefill-cublas-projections", "--lookup-ngram"}) {
++    for (const char* flag :
++         {"--prefill-cublas", "--no-prefill-cublas-projections", "--lookup-ngram"}) {
+         failures += expect(qb::usage_text("ninfer_bench").find(flag) != std::string::npos,
+                            std::string("benchmark help omits ") + flag);
+     }
+@@ -337,11 +365,12 @@ int test_measurement_contract() {
+ }
+ 
+ ninfer::GenerationTimings timings(double prepare, double prefill, double decode, double total) {
+-    return {.prepare_seconds = prepare,
+-            .vision_seconds  = 0.0,
+-            .prefill_seconds = prefill,
+-            .decode_seconds  = decode,
+-            .total_seconds   = total};
++    return {.prepare_seconds     = prepare,
++            .first_token_seconds = prepare + prefill,
++            .vision_seconds      = 0.0,
++            .prefill_seconds     = prefill,
++            .decode_seconds      = decode,
++            .total_seconds       = total};
+ }
+ 
+ ninfer::SpeculativeStats speculative(std::uint64_t rounds, std::uint64_t drafted,
+@@ -369,7 +398,7 @@ std::vector<qb::TestResult> sample_results() {
+     tg.test = {qb::TestKind::Decode, 0, 3, "tg3"};
+     tg.reps = {{timings(0.01, 0.1, 0.5, 0.62), speculative(1, 5, 5, 0, {1, 1, 1, 1, 1}), 4},
+                {timings(0.02, 0.1, 1.0, 1.13), speculative(0, 0, 0, 3, {0, 0, 0, 0, 0}), 4}};
+-    tg.workspace_peak_bytes = 1024ULL * 1024ULL;
++    tg.workspace_peak_bytes                      = 1024ULL * 1024ULL;
+     tg.workspace_allocator_peak_bytes            = 512ULL * 1024ULL;
+     tg.reps[0].speculative.ngram_rounds          = 1;
+     tg.reps[0].speculative.ngram_drafted_tokens  = 5;
+@@ -403,14 +432,14 @@ qb::BenchEnvironment sample_environment() {
+     env.memory.sequence          = {2000000000ULL, 1900000000ULL, 1900000000ULL};
+     env.memory.workspace         = {100000000ULL, 0, 0};
+     env.memory.vision_workspace  = ninfer::VisionWorkspaceMemorySummary{
+-         .aggregate_prompt_tokens = 4096,
+-         .max_item_tokens         = 4096,
+-         .general_capacity_bytes  = 75000000ULL,
+-         .encode_peak_bytes       = 90000000ULL,
+-         .handoff_offset_bytes    = 75000000ULL,
+-         .handoff_capacity_bytes  = 25000000ULL,
+-         .handoff_active_bytes    = 0,
+-         .handoff_peak_bytes      = 20000000ULL,
++        .aggregate_prompt_tokens = 4096,
++        .max_item_tokens         = 4096,
++        .general_capacity_bytes  = 75000000ULL,
++        .encode_peak_bytes       = 90000000ULL,
++        .handoff_offset_bytes    = 75000000ULL,
++        .handoff_capacity_bytes  = 25000000ULL,
++        .handoff_active_bytes    = 0,
++        .handoff_peak_bytes      = 20000000ULL,
+     };
+     env.memory.cuda_graph_allowance_bytes = 150000000ULL;
+     env.memory.kv_payload_bytes           = 123456ULL;
+@@ -449,13 +478,15 @@ int test_report_contract() {
+ 
+     failures += expect(report.at("config").at("rope_yarn_factor") == 2.5,
+                        "report preserves runtime YaRN factor");
+-    failures += expect(report.at("schema_version") == 18, "report schema v18");
++    failures += expect(report.at("schema_version") == 19, "report schema v19");
+     failures += expect(report.at("config").at("speculative_backend") == "mtp" &&
+                            report.at("config").at("draft_tokens") == 5,
+                        "report identifies its backend and window");
+     failures += expect(report.at("config").at("ngram_draft_tokens") == 31 &&
+                            report.at("config").at("ngram_min_match") == 12,
+                        "report identifies ngram configuration independently");
++    failures += expect(report.at("config").at("prefix_reuse_enabled") == false,
++                       "benchmark report marks prefix reuse disabled");
+     failures += expect(report.at("artifact_type") == "ninfer_bench_report", "report identity");
+     failures += expect(report.at("artifact").at("path") == "model.ninfer", "artifact path");
+     failures +=
+@@ -480,6 +511,9 @@ int test_report_contract() {
+                        "graph prime output count");
+ 
+     const Json& pp = report.at("tests").at(0);
++    failures += expect(pp.at("fresh_prompt_tokens") == 512 &&
++                           report.at("tests").at(1).at("fresh_prompt_tokens") == 1,
++                       "report gives each request's actual uncached prompt-token count");
+     failures +=
+         expect(pp.at("kind") == "pp" && pp.at("requested_output_tokens") == 1, "pp request shape");
+     failures += expect_near(pp.at("prefill_tok_s_mean").get<double>(), 1536.0, "pp throughput");
+@@ -519,6 +553,8 @@ int test_report_contract() {
+     failures += expect(tg.at("reps").at(0).at("decode_engine_tokens") == 6, "rep engine tokens");
+     failures += expect_near(tg.at("reps").at(0).at("timings").at("decode_seconds").get<double>(),
+                             0.5, "rep GenerationTimings");
++    failures += expect_near(tg.at("reps").at(0).at("timings").at("ttft_seconds").get<double>(),
++                            0.11, "rep TTFT");
+     failures += expect(tg.at("reps").at(0).at("speculative").at("drafted_tokens") == 5,
+                        "rep SpeculativeStats");
+     return failures;
+@@ -550,15 +586,29 @@ int test_human_and_csv_reports() {
+     failures += expect(csv.find("\"trained, \"\"custom\"\"\"") != std::string::npos &&
+                            csv.find("\"/weights/user,model.ninfer\"") != std::string::npos,
+                        "CSV preserves and escapes the actual training instance");
+-    failures += expect(csv.starts_with("label,kind,n_prompt,n_gen,architecture,prefill_signature"),
++    failures += expect(csv.starts_with("label,kind,n_prompt,fresh_prompt_tokens,n_gen,actual_"
++                                       "output_tokens,architecture,prefill_signature"),
+                        "CSV identity columns");
+-    for (const std::string_view field :
+-         {"model_name", "artifact_path", "proposal_head", "ngram_draft_tokens", "ngram_min_match",
+-          "ngram_rounds", "ngram_drafted_tokens", "ngram_accepted_tokens", "kv_payload_bytes",
+-          "load_host_to_device_bytes", "workspace_general_capacity_bytes",
+-          "vision_handoff_capacity_bytes", "cuda_graph_allowance_bytes", "workspace_peak_bytes",
+-          "workspace_allocator_peak_bytes", "spec_acceptance_rate", "decode_output_tok_s_mean",
+-          "decode_engine_tok_s_mean", "total_seconds_mean"}) {
++    for (const std::string_view field : {"model_name",
++                                         "artifact_path",
++                                         "proposal_head",
++                                         "ngram_draft_tokens",
++                                         "ngram_min_match",
++                                         "ngram_rounds",
++                                         "ngram_drafted_tokens",
++                                         "ngram_accepted_tokens",
++                                         "kv_payload_bytes",
++                                         "load_host_to_device_bytes",
++                                         "workspace_general_capacity_bytes",
++                                         "ttft_seconds_mean",
++                                         "vision_handoff_capacity_bytes",
++                                         "cuda_graph_allowance_bytes",
++                                         "workspace_peak_bytes",
++                                         "workspace_allocator_peak_bytes",
++                                         "spec_acceptance_rate",
++                                         "decode_output_tok_s_mean",
++                                         "decode_engine_tok_s_mean",
++                                         "total_seconds_mean"}) {
+         failures += expect(csv.find(field) != std::string::npos,
+                            std::string("CSV field ") + std::string(field));
+     }
+diff --git a/tests/test_speed_of_light.py b/tests/test_speed_of_light.py
+index a4866dfb..db386968 100644
+--- a/tests/test_speed_of_light.py
++++ b/tests/test_speed_of_light.py
+@@ -183,11 +183,13 @@ class SpeedOfLightTests(unittest.TestCase):
+             "memory": {"kv_capacity": 8, "kv_payload_bytes": 64},
+             "tests": [],
+         }
+-        # v18 adds the expert residency and delivery counters, which leave the counted work alone.
++        # v18 adds expert delivery counters; v19 adds fresh-token and TTFT observability.
+         report["schema_version"] = 18
+         assert estimate(report, artifact, 1, 1)["tests"] == []
+         report["schema_version"] = 19
+-        with self.assertRaisesRegex(ValueError, "v16, v17 or v18"):  # noqa: PT027
++        assert estimate(report, artifact, 1, 1)["tests"] == []
++        report["schema_version"] = 20
++        with self.assertRaisesRegex(ValueError, "v16, v17, v18 or v19"):  # noqa: PT027
+             estimate(report, artifact, 1, 1)
+ 
+     def test_speculative_report_is_rejected(self):
+diff --git a/tools/bench/speed_of_light.py b/tools/bench/speed_of_light.py
+index 010ef9e3..d970bfc6 100644
+--- a/tools/bench/speed_of_light.py
++++ b/tools/bench/speed_of_light.py
+@@ -158,11 +158,11 @@ def estimate(
+ ) -> dict:
+     if report.get("artifact_type") != "ninfer_bench_report":
+         raise ValueError("input must be a ninfer_bench JSON report")
+-    # v17 only adds rope_yarn_factor and v18 the expert residency and delivery counters; neither
+-    # changes the counted work.
+-    if report.get("schema_version") not in (16, 17, 18):
++    # v17 adds rope_yarn_factor, v18 expert residency and v19 fresh-token/TTFT profile fields;
++    # none changes the counted model work.
++    if report.get("schema_version") not in (16, 17, 18, 19):
+         raise ValueError(
+-            "speed-of-light accounting requires ninfer_bench schema v16, v17 or v18"
++            "speed-of-light accounting requires ninfer_bench schema v16, v17, v18 or v19"
+         )
+     if (
+         report["load"]["architecture"]

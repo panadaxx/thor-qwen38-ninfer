@@ -1,0 +1,424 @@
+--- a/src/ops/linear/gguf/ggml_bridge.h
++++ b/src/ops/linear/gguf/ggml_bridge.h
+@@ -345,4 +345,15 @@
+                      const std::int32_t* row_ids, int rows, __half* out,
+                      std::int64_t out_row_stride, cudaStream_t stream);
+ 
++// Experimental IQ2_S prefill helper for a proven-contiguous resident expert bank. `bounds_host`
++// is the E+1 routing boundary array already materialized by the caller; `sorted_x` contains
++// routing-sorted BF16 rows [pairs, k], and the FP32 output is written in routing-sorted order.
++// `weight_scratch` is one reusable BF16 bank [experts, rows, k]. Gate and Up call this sequentially
++// with the same scratch. The caller owns opt-in, shape/device guards, pointer-table validation and
++// the workspace lifetime.
++void iq2s_bf16_moe_product(const void* contiguous_weight, std::int64_t row_bytes, int experts,
++                           int rows, int k, const int* bounds_host, int pairs,
++                           const __nv_bfloat16* sorted_x, float* sorted_out,
++                           __nv_bfloat16* weight_scratch, cudaStream_t stream);
++
+ } // namespace ninfer::ops::gguf
+--- a/src/ops/linear/gguf/ggml_bridge.cu
++++ b/src/ops/linear/gguf/ggml_bridge.cu
+@@ -2,6 +2,7 @@
+ // activation quantizers follow ggml's q8_1, reading BF16 and optionally gathering the input columns.
+ 
+ #include "ggml_bridge_internal.cuh"
++#include "ggml_bridge_iq2s_bf16_table.h"
+ #include "core/profile_cupti_range.h"
+ #include "ggml_bridge_occ2.h"
+ #include "ggml_bridge_iq2s_occ2.h"
+@@ -1139,6 +1140,94 @@
+     }
+ }
+ 
++void iq2s_bf16_moe_product(const void* contiguous_weight, std::int64_t row_bytes, int experts,
++                           int rows, int k, const int* bounds_host, int pairs,
++                           const __nv_bfloat16* sorted_x, float* sorted_out,
++                           __nv_bfloat16* weight_scratch, cudaStream_t stream) {
++    const BlockShape block = block_shape(GgmlType::IQ2_S);
++    if (contiguous_weight == nullptr || bounds_host == nullptr || sorted_x == nullptr ||
++        sorted_out == nullptr || weight_scratch == nullptr || experts <= 0 || rows <= 0 ||
++        k <= 0 || k % block.elements != 0 || row_bytes != std::int64_t(k / block.elements) * block.bytes ||
++        pairs <= 0 || bounds_host[0] != 0 || bounds_host[experts] != pairs) {
++        throw std::invalid_argument("gguf IQ2_S BF16 MoE product: invalid inputs");
++    }
++    for (int e = 0; e < experts; ++e) {
++        if (bounds_host[e] < 0 || bounds_host[e] > bounds_host[e + 1] ||
++            bounds_host[e + 1] > pairs) {
++            throw std::invalid_argument("gguf IQ2_S BF16 MoE product: invalid route bounds");
++        }
++    }
++
++    // Reuse one expanded BF16 bank for Gate, then Up. The caller has already checked that
++    // `contiguous_weight` represents exactly these adjacent row-major expert banks.
++    dequantize_rows(GgmlType::IQ2_S, contiguous_weight, row_bytes, k, nullptr, experts * rows,
++                    weight_scratch, k, stream);
++    cublasHandle_t blas = detail::blas_handle();
++    if (cublasSetStream(blas, stream) != CUBLAS_STATUS_SUCCESS) {
++        throw std::runtime_error("gguf IQ2_S BF16 MoE product: cublasSetStream failed");
++    }
++    const float alpha = 1.0f, beta = 0.0f;
++    for (int e = 0; e < experts; ++e) {
++        const int first = bounds_host[e];
++        const int m     = bounds_host[e + 1] - first;
++        if (m == 0) { continue; }
++        const auto* w = weight_scratch + std::int64_t(e) * rows * k;
++        const auto* x = sorted_x + std::int64_t(first) * k;
++        auto* y       = sorted_out + std::int64_t(first) * rows;
++        const cublasStatus_t status = cublasGemmEx(
++            blas, CUBLAS_OP_T, CUBLAS_OP_N, rows, m, k, &alpha, w, CUDA_R_16BF, k,
++            x, CUDA_R_16BF, k, &beta, y, CUDA_R_32F, rows, CUBLAS_COMPUTE_32F,
++            CUBLAS_GEMM_DEFAULT_TENSOR_OP);
++        if (status != CUBLAS_STATUS_SUCCESS) {
++            throw std::runtime_error("gguf IQ2_S BF16 MoE product: cublasGemmEx failed");
++        }
++    }
++}
++
++void iq2s_bf16_moe_product_from_table(const void* const* weight_table,
++                                     std::int64_t row_bytes, int experts, int rows, int k,
++                                     const int* bounds_host, int pairs,
++                                     const __nv_bfloat16* sorted_x, float* sorted_out,
++                                     __nv_bfloat16* weight_scratch, cudaStream_t stream) {
++    const BlockShape block = block_shape(GgmlType::IQ2_S);
++    if (weight_table == nullptr || bounds_host == nullptr || sorted_x == nullptr ||
++        sorted_out == nullptr || weight_scratch == nullptr || experts <= 0 || rows <= 0 ||
++        k <= 0 || k % block.elements != 0 ||
++        row_bytes != std::int64_t(k / block.elements) * block.bytes || pairs <= 0 ||
++        bounds_host[0] != 0 || bounds_host[experts] != pairs) {
++        throw std::invalid_argument("gguf IQ2_S BF16 table product: invalid inputs");
++    }
++    for (int e = 0; e < experts; ++e) {
++        if (bounds_host[e] < 0 || bounds_host[e] > bounds_host[e + 1] ||
++            bounds_host[e + 1] > pairs) {
++            throw std::invalid_argument("gguf IQ2_S BF16 table product: invalid route bounds");
++        }
++    }
++
++    iq2s_bf16_dequantize_table(weight_table, experts, rows, row_bytes, k, weight_scratch, k,
++                               stream);
++    cublasHandle_t blas = detail::blas_handle();
++    if (cublasSetStream(blas, stream) != CUBLAS_STATUS_SUCCESS) {
++        throw std::runtime_error("gguf IQ2_S BF16 table product: cublasSetStream failed");
++    }
++    const float alpha = 1.0f, beta = 0.0f;
++    for (int e = 0; e < experts; ++e) {
++        const int first = bounds_host[e];
++        const int m = bounds_host[e + 1] - first;
++        if (m == 0) { continue; }
++        const auto* w = weight_scratch + std::int64_t(e) * rows * k;
++        const auto* x = sorted_x + std::int64_t(first) * k;
++        auto* y = sorted_out + std::int64_t(first) * rows;
++        const cublasStatus_t status = cublasGemmEx(
++            blas, CUBLAS_OP_T, CUBLAS_OP_N, rows, m, k, &alpha, w, CUDA_R_16BF, k,
++            x, CUDA_R_16BF, k, &beta, y, CUDA_R_32F, rows, CUBLAS_COMPUTE_32F,
++            CUBLAS_GEMM_DEFAULT_TENSOR_OP);
++        if (status != CUBLAS_STATUS_SUCCESS) {
++            throw std::runtime_error("gguf IQ2_S BF16 table product: cublasGemmEx failed");
++        }
++    }
++}
++
+ void dequantize_rows(GgmlType type, const void* weight, std::int64_t row_bytes, int k,
+                      const std::int32_t* row_ids, int rows, __nv_bfloat16* out,
+                      std::int64_t out_row_stride, cudaStream_t stream) {
+--- a/src/ops/moe_experts/moe_experts_gguf.cu
++++ b/src/ops/moe_experts/moe_experts_gguf.cu
+@@ -12,12 +12,16 @@
+ #include "ops/common/fixed_point.cuh"
+ #include "ops/common/silu.h"
+ #include "ops/linear/gguf/gguf_linear.h"
++#include "ops/linear/gguf/ggml_bridge_iq2s_bf16_table.h"
+ 
+ #include <cuda_bf16.h>
+ #include <cuda_fp16.h>
+ 
+ #include <algorithm>
++#include <array>
++#include <atomic>
+ #include <cstdint>
++#include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
+ #include <stdexcept>
+@@ -64,6 +68,35 @@
+     const std::int64_t i = std::int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+     if (i >= count) { return; }
+     out[i] = __float2bfloat16(portable_silu(gate[i]) * up[i]);
++}
++
++// Route-sorted BF16 activation gather, copying eight BF16 values (16 bytes) per lane.
++__global__ void gather_moe_pairs_bf16x8(const __nv_bfloat16* __restrict__ x,
++                                        const std::int32_t* __restrict__ sorted,
++                                        __nv_bfloat16* __restrict__ out, int k, int pairs,
++                                        int per_token) {
++    const int vectors_per_pair = k / 8;
++    const std::int64_t i       = std::int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
++    if (i >= std::int64_t(pairs) * vectors_per_pair) { return; }
++    const int pair  = static_cast<int>(i / vectors_per_pair);
++    const int lane  = static_cast<int>(i % vectors_per_pair);
++    const int token = sorted[pair] / per_token;
++    reinterpret_cast<uint4*>(out)[i] =
++        reinterpret_cast<const uint4*>(x)[std::int64_t(token) * vectors_per_pair + lane];
++}
++
++// Apply the existing portable SiLU/BF16 rounding and scatter in one pass.
++__global__ void swiglu_scatter_kernel(const float* __restrict__ gate,
++                                      const float* __restrict__ up,
++                                      const std::int32_t* __restrict__ sorted,
++                                      __nv_bfloat16* __restrict__ out, std::int64_t count,
++                                      int rows) {
++    const std::int64_t i = std::int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
++    if (i >= count) { return; }
++    const int pair = static_cast<int>(i / rows);
++    const int row  = static_cast<int>(i % rows);
++    const int dst  = sorted[pair];
++    out[std::int64_t(dst) * rows + row] = __float2bfloat16(portable_silu(gate[i]) * up[i]);
+ }
+ 
+ // fixed[t][r] += each of token t's pairs' contribution weights[p] * down[p][r] in 2^-32 fixed
+@@ -146,6 +179,94 @@
+            gguf::moe_matrix_supported(detail::gguf_type(table.format), rows, k, true);
+ }
+ 
++bool run_iq2s_bf16_pair(const __nv_bfloat16* m, std::int32_t tokens, std::int32_t pairs,
++                        int per_token,
++                        const GgufExpertTable& gate, const GgufExpertTable& up, int experts,
++                        bool device_resident, const gguf::MoeRouting& routing,
++                        __nv_bfloat16* middle, WorkspaceArena& workspace, cudaStream_t stream) {
++    const char* enabled = std::getenv("NINFER_SM110_IQ2S_BF16_PAIR");
++    if (enabled == nullptr || std::strcmp(enabled, "1") != 0 || !device_resident ||
++        experts != 256 || tokens < 4096 || tokens > 8192 ||
++        pairs != tokens * kTopK || per_token != kTopK || m == nullptr ||
++        gate.format != QType::GGUF_IQ2_S || up.format != QType::GGUF_IQ2_S ||
++        gate.row_bytes != 820 || up.row_bytes != 820 || gate.experts == nullptr ||
++        up.experts == nullptr || routing.bounds == nullptr || routing.sorted == nullptr) {
++        return false;
++    }
++
++    int device = -1;
++    cudaDeviceProp properties{};
++    CUDA_CHECK(cudaGetDevice(&device));
++    CUDA_CHECK(cudaGetDeviceProperties(&properties, device));
++    if (properties.major != 11 || properties.minor != 0 || properties.multiProcessorCount != 14) {
++        return false;
++    }
++    cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
++    CUDA_CHECK(cudaStreamIsCapturing(stream, &capture_status));
++    if (capture_status != cudaStreamCaptureStatusNone) { return false; }
++
++    // Copy the small tables with the routing bounds once on this prefill-only path. Validate
++    // every entry is non-null, but pass the original device tables to the table decoder so each
++    // expert can reside in an independent allocation.
++    std::array<const void*, 256> gate_ptrs{}, up_ptrs{};
++    std::array<int, 257> bounds{};
++    CUDA_CHECK(cudaMemcpyAsync(gate_ptrs.data(), gate.experts, sizeof(gate_ptrs),
++                              cudaMemcpyDeviceToHost, stream));
++    CUDA_CHECK(cudaMemcpyAsync(up_ptrs.data(), up.experts, sizeof(up_ptrs),
++                              cudaMemcpyDeviceToHost, stream));
++    CUDA_CHECK(cudaMemcpyAsync(bounds.data(), routing.bounds, sizeof(bounds), cudaMemcpyDeviceToHost,
++                              stream));
++    CUDA_CHECK(cudaStreamSynchronize(stream));
++    for (int e = 0; e < experts; ++e) {
++        if (gate_ptrs[e] == nullptr || up_ptrs[e] == nullptr) { return false; }
++    }
++    if (bounds.front() != 0 || bounds.back() != pairs) { return false; }
++    for (int e = 0; e < experts; ++e) {
++        if (bounds[e] < 0 || bounds[e] > bounds[e + 1] || bounds[e + 1] > pairs) {
++            return false;
++        }
++    }
++
++    const char* log = std::getenv("NINFER_SM110_IQ2S_BF16_PAIR_LOG");
++    static std::atomic<int> dispatch_logs{0};
++    if (log != nullptr && std::strcmp(log, "1") == 0 &&
++        dispatch_logs.fetch_add(1, std::memory_order_relaxed) < 4) {
++        const std::size_t scratch_bytes =
++            std::size_t(pairs) * kHidden * sizeof(__nv_bfloat16) +
++            std::size_t(experts) * kWidth * kHidden * sizeof(__nv_bfloat16) +
++            2 * std::size_t(pairs) * kWidth * sizeof(float);
++        std::fprintf(stderr,
++                     "IQ2S_BF16_PAIR dispatch=T%d pairs=%d E=%d table_entries=%d scratch_bytes=%zu\n",
++                     int(tokens), int(pairs), int(experts), experts, scratch_bytes);
++    }
++
++    auto pair_scope = workspace.scope();
++    Tensor sorted_x = workspace.alloc(DType::BF16, {kHidden, pairs});
++    Tensor weight_bf16 = workspace.alloc(DType::BF16, {kHidden, kWidth * experts});
++    Tensor gate_plane = workspace.alloc(DType::FP32, {kWidth, pairs});
++    Tensor up_plane = workspace.alloc(DType::FP32, {kWidth, pairs});
++    const auto* input = m;
++    auto* gathered = static_cast<__nv_bfloat16*>(sorted_x.data);
++    const std::int64_t gather_count = std::int64_t(pairs) * (kHidden / 8);
++    gather_moe_pairs_bf16x8<<<static_cast<unsigned>((gather_count + 255) / 256), 256, 0, stream>>>(
++        input, routing.sorted, gathered, kHidden, pairs, per_token);
++    CUDA_CHECK(cudaGetLastError());
++
++    auto* bank = static_cast<__nv_bfloat16*>(weight_bf16.data);
++    auto* gate_out = static_cast<float*>(gate_plane.data);
++    auto* up_out = static_cast<float*>(up_plane.data);
++    gguf::iq2s_bf16_moe_product_from_table(gate.experts, gate.row_bytes, experts, kWidth,
++                                           kHidden, bounds.data(), pairs, gathered, gate_out, bank,
++                                           stream);
++    gguf::iq2s_bf16_moe_product_from_table(up.experts, up.row_bytes, experts, kWidth, kHidden,
++                                           bounds.data(), pairs, gathered, up_out, bank, stream);
++    const std::int64_t count = std::int64_t(kWidth) * pairs;
++    swiglu_scatter_kernel<<<static_cast<unsigned>((count + 255) / 256), 256, 0, stream>>>(
++        gate_out, up_out, routing.sorted, middle, count, kWidth);
++    CUDA_CHECK(cudaGetLastError());
++    return true;
++}
++
+ // One bank's pass: the middle of every pair, then its weighted down product into `fixed`.
+ void run_bank(const Tensor& routing_ids, std::int32_t pairs, std::int32_t experts, int per_token,
+               const float* pair_weights, const __nv_bfloat16* m, const void* activation,
+@@ -164,7 +285,10 @@
+     auto* middle_p                  = static_cast<__nv_bfloat16*>(middle.data);
+     const gguf::MoeTable gate_table = table(gate, kWidth, kHidden);
+     const gguf::MoeTable up_table   = table(up, kWidth, kHidden);
+-    if (matrix_path(tokens, device_resident, gate, kWidth, kHidden) &&
++    if (run_iq2s_bf16_pair(m, tokens, pairs, per_token, gate, up,
++                           experts, device_resident, routing, middle_p, workspace, stream)) {
++        // The candidate has already built middle_p in original pair order.
++    } else if (matrix_path(tokens, device_resident, gate, kWidth, kHidden) &&
+         matrix_path(tokens, device_resident, up, kWidth, kHidden)) {
+         // Each projection's pairs gathered in routing order and quantized for its schedule; an
+         // expert receives at most one pair per token.
+@@ -314,6 +438,19 @@
+             (void)layout.alloc(DType::U8, {activation_bytes});
+             (void)layout.alloc(DType::FP32, {kWidth, pairs});
+         }
++        (void)layout.alloc(DType::FP32, {kWidth, pairs});
++    }
++    const char* pair_env = std::getenv("NINFER_SM110_IQ2S_BF16_PAIR");
++    if (pair_env != nullptr && std::strcmp(pair_env, "1") == 0 && tokens >= 4096 &&
++        tokens <= 8192) {
++        // The opt-in paired IQ2_S path gathers each route's BF16 activation once, expands one
++        // E256 Gate or Up bank at a time, and keeps two sorted FP32 result planes until fused
++        // SwiGLU+scatter. This scope is a sibling of the MMQ planes above and matches the runtime
++        // pair_scope exactly; it does not add a second original-order FP32 pair of planes.
++        auto pair = layout.scope();
++        (void)layout.alloc(DType::BF16, {kHidden, pairs});
++        (void)layout.alloc(DType::BF16, {kHidden, kWidth * 256});
++        (void)layout.alloc(DType::FP32, {kWidth, pairs});
+         (void)layout.alloc(DType::FP32, {kWidth, pairs});
+     }
+     (void)layout.alloc(DType::U8,
+--- a/src/ops/linear/gguf/sources.cmake
++++ b/src/ops/linear/gguf/sources.cmake
+@@ -78,6 +78,7 @@
+ target_sources(ninfer_ops PRIVATE "${CMAKE_CURRENT_LIST_DIR}/gguf_linear.cpp")
+ target_sources(ninfer_ggml_quants PRIVATE "${CMAKE_CURRENT_LIST_DIR}/q6k_static_vector.cu")
+ target_sources(ninfer_ggml_quants PRIVATE "${CMAKE_CURRENT_LIST_DIR}/q6k_cooperative.cu")
++target_sources(ninfer_ggml_quants PRIVATE "${CMAKE_CURRENT_LIST_DIR}/iq2s_bf16_table.cu")
+ 
+ target_sources(ninfer_ggml_quants PRIVATE "${CMAKE_CURRENT_LIST_DIR}/ggml_mmq_iq4nl_occ2.cu")
+ 
+--- /dev/null
++++ b/src/ops/linear/gguf/ggml_bridge_iq2s_bf16_table.h
+@@ -0,0 +1,21 @@
++#pragma once
++
++#include <cuda_bf16.h>
++#include <cuda_runtime.h>
++
++#include <cstdint>
++
++namespace ninfer::ops::gguf {
++
++// Table-based IQ2_S expansion for E independently placed device expert banks. Each expert entry
++// addresses its own contiguous [rows, k] byte range; expert ranges need not be adjacent.
++void iq2s_bf16_dequantize_table(const void* const* weight_table, int experts, int rows_per_expert,
++                               std::int64_t row_bytes, int k, __nv_bfloat16* out,
++                               std::int64_t out_row_stride, cudaStream_t stream);
++
++void iq2s_bf16_moe_product_from_table(const void* const* weight_table, std::int64_t row_bytes,
++                                      int experts, int rows, int k, const int* bounds_host,
++                                      int pairs, const __nv_bfloat16* sorted_x, float* sorted_out,
++                                      __nv_bfloat16* weight_scratch, cudaStream_t stream);
++
++} // namespace ninfer::ops::gguf
+--- /dev/null
++++ b/src/ops/linear/gguf/iq2s_bf16_table.cu
+@@ -0,0 +1,82 @@
++#include "ggml_bridge_iq2s_bf16_table.h"
++
++#include "ggml_bridge_vec.cuh"
++
++#include <algorithm>
++#include <cstdint>
++#include <stdexcept>
++#include <string>
++
++namespace ninfer::ops::gguf {
++namespace {
++
++__global__ void iq2s_bf16_dequantize_table_kernel(const void* const* __restrict__ weight_table,
++                                                  int experts, int rows_per_expert,
++                                                  std::int64_t row_bytes, int k,
++                                                  __nv_bfloat16* __restrict__ out,
++                                                  std::int64_t out_row_stride) {
++    using D = detail::vec::Decoder<GGML_TYPE_IQ2_S>;
++    constexpr int kTable = D::kTableWords;
++    constexpr int kPerBlock = D::kBlockElems / 32;
++    __shared__ __align__(16) std::uint32_t table[kTable];
++    const std::uint32_t* source_table = D::table();
++    for (int i = threadIdx.x; i < kTable; i += blockDim.x) { table[i] = source_table[i]; }
++    __syncthreads();
++
++    const int slices = k / 32;
++    const std::int64_t rows = std::int64_t(experts) * rows_per_expert;
++    const std::int64_t total = rows * slices;
++    for (std::int64_t i = std::int64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < total;
++         i += std::int64_t(gridDim.x) * blockDim.x) {
++        const std::int64_t global_row = i / slices;
++        const int slice = static_cast<int>(i % slices);
++        const int expert = static_cast<int>(global_row / rows_per_expert);
++        const int local_row = static_cast<int>(global_row % rows_per_expert);
++        const auto* expert_base = static_cast<const std::uint8_t*>(weight_table[expert]);
++        const auto* block = expert_base + std::int64_t(local_row) * row_bytes +
++                            std::int64_t(slice / kPerBlock) * D::kBlockBytes;
++        detail::vec::Slice decoded;
++        D::decode(block, slice % kPerBlock, table, decoded);
++        __nv_bfloat16* dst = out + global_row * out_row_stride + 32 * std::int64_t(slice);
++#pragma unroll
++        for (int q = 0; q < 4; ++q) {
++            float values[8];
++#pragma unroll
++            for (int t = 0; t < 8; ++t) {
++                values[t] = detail::vec::slice_value<GGML_TYPE_IQ2_S>(decoded, 2 * q + t / 4,
++                                                                      t % 4);
++            }
++            detail::vec::store8(dst + 8 * q, values);
++        }
++    }
++}
++
++} // namespace
++
++void iq2s_bf16_dequantize_table(const void* const* weight_table, int experts, int rows_per_expert,
++                               std::int64_t row_bytes, int k, __nv_bfloat16* out,
++                               std::int64_t out_row_stride, cudaStream_t stream) {
++    using D = detail::vec::Decoder<GGML_TYPE_IQ2_S>;
++    const std::int64_t exact_row_bytes = std::int64_t(k / D::kBlockElems) * D::kBlockBytes;
++    if (weight_table == nullptr || experts <= 0 || rows_per_expert <= 0 || out == nullptr ||
++        k <= 0 || k % D::kBlockElems != 0 || row_bytes != exact_row_bytes ||
++        out_row_stride < k || out_row_stride % 8 != 0 ||
++        reinterpret_cast<std::uintptr_t>(out) % 16 != 0) {
++        throw std::invalid_argument("gguf IQ2_S table dequantize: unsupported geometry");
++    }
++    const std::int64_t total = std::int64_t(experts) * rows_per_expert * (k / 32);
++    static const int resident = [] {
++        int blocks = 0;
++        detail::check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
++                          &blocks, iq2s_bf16_dequantize_table_kernel, 256, 0),
++                      "IQ2_S table BF16 dequantize occupancy");
++        return std::max(blocks, 1);
++    }();
++    const int blocks = static_cast<int>(std::min<std::int64_t>(
++        (total + 255) / 256, std::int64_t(resident) * detail::device_facts().sm_count));
++    iq2s_bf16_dequantize_table_kernel<<<blocks, 256, 0, stream>>>(
++        weight_table, experts, rows_per_expert, row_bytes, k, out, out_row_stride);
++    detail::check(cudaGetLastError(), "IQ2_S table BF16 dequantize launch");
++}
++
++} // namespace ninfer::ops::gguf

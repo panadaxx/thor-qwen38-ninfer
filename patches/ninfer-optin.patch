@@ -1,0 +1,773 @@
+--- a/src/ops/CMakeLists.txt
++++ b/src/ops/CMakeLists.txt
+@@ -83,3 +83,21 @@
+   target_link_libraries(ninfer_ggml_quants PRIVATE ${CMAKE_DL_LIBS})
+   target_link_libraries(ninfer_ops PRIVATE ${CMAKE_DL_LIBS})
+ endif()
++
++# T077 opt-in standalone NVIDIA Edge SM110 Dense AOT; no TensorRT runtime.
++set(NINFER_EDGE_DENSE_AOT_DIR "" CACHE PATH "Reviewed standalone Edge Dense AOT directory")
++set(_ninfer_edge_source "${CMAKE_CURRENT_LIST_DIR}/linear/gguf/edge_dense.cpp")
++target_sources(ninfer_ops PRIVATE "${_ninfer_edge_source}")
++if(NINFER_EDGE_DENSE_AOT_DIR)
++  if(NOT NINFER_ARCH_SM110_COMPAT)
++    message(FATAL_ERROR "Edge Dense prototype requires SM110 compatibility build")
++  endif()
++  if(NOT EXISTS "${NINFER_EDGE_DENSE_AOT_DIR}/libedge_dense.a" OR
++     NOT EXISTS "${NINFER_EDGE_DENSE_AOT_DIR}/include/nvfp4_a16_blackwell_gemm_bf16_tm128_tn8_tk64.h")
++    message(FATAL_ERROR "Edge Dense AOT archive/header missing")
++  endif()
++  set_source_files_properties("${_ninfer_edge_source}" PROPERTIES
++    COMPILE_DEFINITIONS NINFER_EDGE_DENSE_AOT=1
++    INCLUDE_DIRECTORIES "${NINFER_EDGE_DENSE_AOT_DIR}/include")
++  target_link_libraries(ninfer_ops PRIVATE "${NINFER_EDGE_DENSE_AOT_DIR}/libedge_dense.a" CUDA::cuda_driver)
++endif()
+--- a/src/ops/linear/gguf/gguf_linear.cpp
++++ b/src/ops/linear/gguf/gguf_linear.cpp
+@@ -1,4 +1,5 @@
+ #include "ops/linear/gguf/gguf_linear.h"
++#include "ops/linear/gguf/edge_dense.h"
+ 
+ #include "core/layout.h"
+ #include "ops/linear/sm70/sm70_gemm.h"
+@@ -569,6 +570,7 @@
+ 
+ void gguf_linear(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& workspace,
+                  cudaStream_t stream) {
++    if (ninfer::ops::edge_dense::try_linear(x, w, out, stream)) return;
+     GgufProduct product{&w, &out, 0, GgufEpilogue::Store};
+     if (out.dtype == DType::FP32) {
+         if (!out.is_contiguous() || out.ne[0] != w.n || out.ne[1] != x.ne[1]) {
+--- a/src/models/qwen4_exp/model.cpp
++++ b/src/models/qwen4_exp/model.cpp
+@@ -499,6 +499,10 @@
+         new Model(std::move(config), options, std::move(weights), std::move(stages),
+                   std::move(bound), std::move(resources), std::move(info), std::move(backing),
+                   std::move(hc_q8_sidecar)));
++    if (const char* edge_dir = std::getenv("NINFER_EDGE_NVFP4_DENSE_DIR"); edge_dir && *edge_dir) {
++        model->edge_dense_sidecar_ = std::make_shared<EdgeDenseSidecar>(
++            std::filesystem::path(edge_dir), reader, model->bound_, device);
++    }
+     model->files_          = std::move(files);
+     model->replicas_       = qwen3_5::AuxiliaryReplicas(model->bound_, device);
+     model->vision_config_  = std::move(vision_config);
+--- a/src/models/qwen4_exp/model.h
++++ b/src/models/qwen4_exp/model.h
+@@ -17,6 +17,7 @@
+ #include "models/qwen3_5/weights.h"
+ #include "models/qwen4_exp/config.h"
+ #include "models/qwen4_exp/hc_q8_sidecar.h"
++#include "models/qwen4_exp/edge_dense_sidecar.h"
+ #include "models/qwen4_exp/expert_location.h"
+ #include "ninfer/ops/weight_input.h"
+ #include "ninfer/model_enums.h"
+@@ -183,6 +184,7 @@
+     StagePlan stages_;
+     // Declared before bound_: its device buffers and WeightParents back bound_ views.
+     std::shared_ptr<HcQ8Sidecar> hc_q8_sidecar_;
++    std::shared_ptr<EdgeDenseSidecar> edge_dense_sidecar_;
+     std::vector<BoundWeight> bound_;
+     FrontendResources resources_;
+     InstanceInfo info_;
+--- a/src/models/qwen4_exp/loading_sources.cmake
++++ b/src/models/qwen4_exp/loading_sources.cmake
+@@ -2,6 +2,7 @@
+   "${CMAKE_CURRENT_LIST_DIR}/config.cpp"
+   "${CMAKE_CURRENT_LIST_DIR}/model.cpp"
+   "${CMAKE_CURRENT_LIST_DIR}/hc_q8_sidecar.cpp"
++  "${CMAKE_CURRENT_LIST_DIR}/edge_dense_sidecar.cpp"
+   "${CMAKE_CURRENT_LIST_DIR}/ngram_component.cpp"
+   "${CMAKE_CURRENT_LIST_DIR}/ngram_hash.cpp"
+   "${CMAKE_CURRENT_LIST_DIR}/ngram_profile.cpp"
+--- a/apps/perplexity/main.cpp
++++ b/apps/perplexity/main.cpp
+@@ -54,6 +54,7 @@
+     std::uint32_t stride      = 2048;
+     bool disjoint             = false;
+     int device                = 0;
++    std::string device_profile = "auto";
+     // Qwen3.8-Flash-Next: a pipeline over several devices, host-resident experts and their
+     // device cache, and where the n-gram table comes from.
+     std::vector<int> devices;
+@@ -104,7 +105,7 @@
+            "<directory>]\n"
+            "       [--lm-head-q4|--lm-head-q6] [--embedding-q4|--embedding-q6] [--mtp-experts-q4] "
+            "[--gdn-state-fp16]\n"
+-           "       [--mlp-a8-decode] [--no-prefill-a8] [--rope-yarn] [--rope-yarn-factor F]\n"
++           "       [--device-profile auto|off] [--mlp-a8-decode] [--no-prefill-a8] [--rope-yarn] [--rope-yarn-factor F]\n"
+            "       [--rope-scaling-factor F [--rope-scaling-original-context N]]\n"
+            "       (--mlp-a8-decode is inert here: the route it enables is verify-phase"
+            "        only, and scoring runs the prefill phase)\n"
+@@ -248,6 +249,10 @@
+                     value("--rope-scaling-original-context"));
+         } else if (option == "--mlp-a8-decode") {
+             out.mlp_a8_decode = true;
++        } else if (option == "--device-profile") {
++            out.device_profile = value("--device-profile");
++            if (out.device_profile != "auto" && out.device_profile != "off")
++                usage_error("--device-profile must be auto or off");
+         } else if (option == "--no-prefill-a8") {
+             out.prefill_a8 = false;
+         } else if (option == "--prefill-cublas") {
+@@ -369,6 +374,7 @@
+     engine_options.artifact_path    = options.artifact;
+     engine_options.purpose          = ninfer::EnginePurpose::CausalScoring;
+     engine_options.device           = options.device;
++    engine_options.device_profile   = options.device_profile;
+     engine_options.devices                       = options.devices;
+     engine_options.expert_residency              = options.expert_residency;
+     engine_options.expert_cache_bytes            = options.expert_cache_bytes;
+--- /dev/null
++++ b/src/ops/linear/gguf/edge_dense.h
+@@ -0,0 +1,21 @@
++// SPDX-License-Identifier: Apache-2.0
++#pragma once
++#include "core/tensor.h"
++#include "core/weight.h"
++#include <cuda_runtime.h>
++#include <filesystem>
++#include <memory>
++namespace ninfer::ops::edge_dense {
++class Registration;
++// Pointers borrow model-owned GPU storage. Registration must die before that
++// storage.
++std::shared_ptr<Registration>
++register_plane(const void *original_q6_base, const void *codes,
++               const void *scales, const void *global,
++               const std::filesystem::path &cubin);
++// Fixed experimental family only: Q6 GDN QKV leading range [10240,2560] of a merged parent, BF16
++// Store. All other cases return false and retain the production GGUF
++// implementation.
++bool try_linear(const Tensor &x, const Weight &w, Tensor &out,
++                cudaStream_t stream);
++} // namespace ninfer::ops::edge_dense
+--- /dev/null
++++ b/src/ops/linear/gguf/edge_dense.cpp
+@@ -0,0 +1,191 @@
++// SPDX-License-Identifier: Apache-2.0
++// Minimal NInfer ABI shim around unmodified NVIDIA TensorRT-Edge-LLM kernels.
++#include "edge_dense.h"
++#include <atomic>
++#include <cstdio>
++#include <fstream>
++#include <map>
++#include <mutex>
++#include <stdexcept>
++#include <vector>
++#if defined(NINFER_EDGE_DENSE_AOT)
++#include "nvfp4_a16_blackwell_gemm_bf16_tm128_tn8_tk64.h"
++#include <cuda.h>
++namespace ninfer::ops::edge_dense {
++namespace {
++void check(cudaError_t e, const char *where) {
++  if (e != cudaSuccess)
++    throw std::runtime_error(std::string(where) + ": " + cudaGetErrorString(e));
++}
++void driver(CUresult e, const char *where) {
++  if (e != CUDA_SUCCESS) {
++    const char *s = nullptr;
++    cuGetErrorString(e, &s);
++    throw std::runtime_error(std::string(where) + ": " + (s ? s : "DriverAPI"));
++  }
++}
++struct Backend {
++  CUmodule gemv{};
++  CUfunction fn{};
++  nvfp4_a16_blackwell_gemm_bf16_tm128_tn8_tk64_Kernel_Module_t tc{};
++  std::filesystem::path path;
++  CUcontext context{};
++  explicit Backend(const std::filesystem::path &p) : path(p) {
++    cudaDeviceProp prop{};
++    int device = -1;
++    check(cudaGetDevice(&device), "Edge device");
++    check(cudaGetDeviceProperties(&prop, device), "Edge props");
++    if (device != 0 || prop.major != 11 || prop.minor != 0 ||
++        prop.multiProcessorCount != 14)
++      throw std::runtime_error(
++          "Edge Dense prototype requires rank0 LS9 SM110/14");
++    driver(cuCtxGetCurrent(&context), "Edge context");
++    if (!context)
++      throw std::runtime_error("Edge runtime primary context missing");
++    auto bytes = std::filesystem::file_size(path);
++    if (bytes < 64 || bytes > 2 * 1024 * 1024)
++      throw std::runtime_error("Edge Dense CUBIN size");
++    std::ifstream f(path, std::ios::binary);
++    std::vector<char> b(static_cast<size_t>(bytes));
++    f.read(b.data(), b.size());
++    if (size_t(f.gcount()) != b.size() || b[0] != char(0x7f) || b[1] != 'E' ||
++        b[2] != 'L' || b[3] != 'F')
++      throw std::runtime_error("Edge Dense invalid CUBIN");
++    try {
++      driver(cuModuleLoadData(&gemv, b.data()), "Edge GEMV load");
++      driver(cuModuleGetFunction(&fn, gemv, "nvfp4_a16_blackwell_gemv_m1_sk1"),
++             "Edge GEMV symbol");
++      nvfp4_a16_blackwell_gemm_bf16_tm128_tn8_tk64_Kernel_Module_Load(&tc);
++      check(cudaGetLastError(), "Edge TC load");
++      if (!tc.module)
++        throw std::runtime_error("Edge TC module missing");
++    } catch (...) {
++      if (tc.module)
++        cudaLibraryUnload(tc.module);
++      if (gemv)
++        cuModuleUnload(gemv);
++      throw;
++    }
++  }
++  ~Backend() {
++    if (tc.module)
++      cudaLibraryUnload(tc.module);
++    if (gemv)
++      cuModuleUnload(gemv);
++  }
++};
++std::mutex registry_mutex;
++std::map<const void *, std::weak_ptr<Registration>> registry;
++std::weak_ptr<Backend> backend_cache;
++std::atomic<bool> has_planes{false};
++} // namespace
++class Registration {
++public:
++  const void *original;
++  const void *codes;
++  const void *scales;
++  const void *global;
++  std::shared_ptr<Backend> backend;
++  bool registered = false;
++  Registration(const void *o, const void *c, const void *s, const void *g,
++               std::shared_ptr<Backend> b)
++      : original(o), codes(c), scales(s), global(g), backend(std::move(b)) {}
++  ~Registration() {
++    if (!registered)
++      return;
++    std::lock_guard<std::mutex> lock(registry_mutex);
++    auto f = registry.find(original);
++    if (f != registry.end() && f->second.expired())
++      registry.erase(f);
++    has_planes.store(!registry.empty(), std::memory_order_release);
++  }
++};
++std::shared_ptr<Registration>
++register_plane(const void *original, const void *codes, const void *scales,
++               const void *global, const std::filesystem::path &cubin) {
++  if (!original || !codes || !scales || !global ||
++      reinterpret_cast<uintptr_t>(codes) % 16 ||
++      reinterpret_cast<uintptr_t>(scales) % 16 ||
++      reinterpret_cast<uintptr_t>(global) % 4)
++    throw std::runtime_error("Edge Dense null/unaligned registration");
++  std::lock_guard<std::mutex> lock(registry_mutex);
++  if (auto f = registry.find(original);
++      f != registry.end() && !f->second.expired())
++    throw std::runtime_error("Edge Dense duplicate parent registration");
++  auto b = backend_cache.lock();
++  if (b && b->path != cubin)
++    throw std::runtime_error("Edge Dense incompatible backend while active");
++  if (!b) {
++    b = std::make_shared<Backend>(cubin);
++    backend_cache = b;
++  }
++  auto r = std::make_shared<Registration>(original, codes, scales, global,
++                                          std::move(b));
++  registry[original] = r;
++  r->registered = true;
++  has_planes.store(true, std::memory_order_release);
++  return r;
++}
++bool try_linear(const Tensor &x, const Weight &w, Tensor &out,
++                cudaStream_t stream) {
++  if (!has_planes.load(std::memory_order_acquire) ||
++      w.qtype != QType::GGUF_Q6_K || w.layout != QuantLayout::GgufBlocks ||
++      w.n != 10240 || w.k != 2560 || w.qdata != w.payload || w.input_columns)
++    return false;
++  std::shared_ptr<Registration> r;
++  {
++    std::lock_guard<std::mutex> lock(registry_mutex);
++    auto f = registry.find(w.payload);
++    if (f == registry.end() || !(r = f->second.lock()))
++      return false;
++  }
++  if (x.dtype != DType::BF16 || out.dtype != DType::BF16 ||
++      !x.is_contiguous() || !out.is_contiguous() || x.ne[0] != 2560 ||
++      out.ne[0] != 10240 || out.ne[1] != x.ne[1] || x.ne[1] < 1 ||
++      x.ne[1] > 8192)
++    throw std::runtime_error(
++        "Edge Dense registered family received unsupported tensor geometry");
++  const int t = x.ne[1];
++  if (t == 1) {
++    void *a = x.data, *c = const_cast<void *>(r->codes),
++         *s = const_cast<void *>(r->scales), *g = const_cast<void *>(r->global),
++         *o = out.data, *partial = nullptr;
++    void *args[] = {&a, &c, &s, &g, &o, &partial};
++    driver(cuLaunchKernel(r->backend->fn, 80, 1, 1, 256, 1, 1, 0,
++                          reinterpret_cast<CUstream>(stream), args, nullptr),
++           "Edge GEMV launch");
++    static std::atomic<bool> logged{false};
++    if (!logged.exchange(true))
++      std::fprintf(stderr, "EDGE_NVFP4_DENSE dispatch T1 N10240 K2560 official "
++                           "GEMV sk1; Q6 backing retained\n");
++  } else {
++    int result = cute_dsl_nvfp4_a16_blackwell_gemm_bf16_tm128_tn8_tk64_wrapper(
++        &r->backend->tc, x.data, const_cast<void *>(r->codes),
++        const_cast<void *>(r->scales), const_cast<void *>(r->global), out.data,
++        t, 10240, 2560, 14, stream);
++    if (result)
++      throw std::runtime_error("Edge Dense TC wrapper failed");
++    static std::atomic<bool> logged{false};
++    if (!logged.exchange(true))
++      std::fprintf(stderr,
++                   "EDGE_NVFP4_DENSE dispatch T%d N10240 K2560 official TC; "
++                   "quality scoring uses sidecar\n",
++                   t);
++  }
++  check(cudaGetLastError(), "Edge Dense launch");
++  return true;
++}
++} // namespace ninfer::ops::edge_dense
++#else
++namespace ninfer::ops::edge_dense {
++class Registration {};
++std::shared_ptr<Registration> register_plane(const void *, const void *,
++                                             const void *, const void *,
++                                             const std::filesystem::path &) {
++  throw std::runtime_error("Edge Dense AOT support not compiled");
++}
++bool try_linear(const Tensor &, const Weight &, Tensor &, cudaStream_t) {
++  return false;
++}
++} // namespace ninfer::ops::edge_dense
++#endif
+--- /dev/null
++++ b/src/models/qwen4_exp/edge_dense_sidecar.h
+@@ -0,0 +1,40 @@
++// SPDX-License-Identifier: Apache-2.0
++#pragma once
++
++#include "core/arena.h"
++#include "core/device.h"
++#include "artifact/reader.h"
++#include "models/qwen3_5/weights.h"
++
++#include <filesystem>
++#include <memory>
++#include <vector>
++
++namespace ninfer::ops::edge_dense { class Registration; }
++
++namespace ninfer::models::qwen4_exp {
++
++// Private T077 prototype. The owner must be created after artifact materialization and before
++// graph capture. It registers only full Q6_K GDN-QKV parents; it never replaces source views.
++class EdgeDenseSidecar {
++public:
++    EdgeDenseSidecar(const std::filesystem::path& directory,
++                     const artifact::Reader& reader,
++                     std::vector<qwen3_5::BoundWeight>& bound,
++                     DeviceContext& device);
++    ~EdgeDenseSidecar();
++
++    EdgeDenseSidecar(const EdgeDenseSidecar&) = delete;
++    EdgeDenseSidecar& operator=(const EdgeDenseSidecar&) = delete;
++    EdgeDenseSidecar(EdgeDenseSidecar&&) noexcept;
++    EdgeDenseSidecar& operator=(EdgeDenseSidecar&&) noexcept;
++
++    [[nodiscard]] std::size_t parent_count() const noexcept;
++
++private:
++    struct Entry;
++    // Entry destroys Registration before its plane allocations (see declaration order there).
++    std::vector<std::unique_ptr<Entry>> entries_;
++};
++
++} // namespace ninfer::models::qwen4_exp
+--- /dev/null
++++ b/src/models/qwen4_exp/edge_dense_sidecar.cpp
+@@ -0,0 +1,390 @@
++// SPDX-License-Identifier: Apache-2.0
++// Private T077 prototype. Loader pattern derived from NInfer's hc_q8_sidecar.cpp (Apache-2.0).
++#include "edge_dense_sidecar.h"
++
++#include "artifact/framing.h"
++#include "artifact/schema.h"
++#include "core/weight_view.h"
++#include "models/qwen3_5/frontend/digest.h"
++#include "ops/linear/gguf/edge_dense.h"
++
++#include <nlohmann/json.hpp>
++
++#include <algorithm>
++#include <array>
++#include <charconv>
++#include <cstddef>
++#include <cstdint>
++#include <fstream>
++#include <limits>
++#include <map>
++#include <cmath>
++#include <cstring>
++#include <set>
++#include <span>
++#include <stdexcept>
++#include <string>
++#include <string_view>
++#include <utility>
++
++namespace ninfer::models::qwen4_exp {
++namespace {
++
++using Json = nlohmann::json;
++using BoundWeight = qwen3_5::BoundWeight;
++constexpr std::uint64_t kRows = 10240;
++constexpr std::uint64_t kCols = 2560;
++constexpr std::uint64_t kElements = kRows * kCols;
++constexpr std::uint64_t kQ6Bytes = kRows * (kCols / 256) * 210;
++constexpr std::uint64_t kQ6BytesPerRow = (kCols / 256) * 210;
++constexpr std::uint64_t kCodesBytes = kElements / 2;
++constexpr std::uint64_t kScalesBytes = kElements / 16;
++constexpr std::uint64_t kGlobalBytes = sizeof(float);
++constexpr std::uint64_t kNvfp4Bytes = kCodesBytes + kScalesBytes + kGlobalBytes;
++constexpr std::size_t kExpectedParents = 22;
++constexpr std::uint64_t kMaxTotalSidecarBytes = kExpectedParents * kNvfp4Bytes;
++constexpr std::string_view kTargetLayout = "edgellm_nvfp4_a16_n128_k64_v1";
++constexpr std::string_view kCubinName = "gemv-10240-2560.cubin";
++
++std::string artifact_hex(const artifact::ArtifactId& id) {
++    constexpr char digits[] = "0123456789abcdef";
++    std::string result;
++    result.reserve(id.size() * 2);
++    for (const auto byte : id) {
++        const auto value = std::to_integer<unsigned>(byte);
++        result.push_back(digits[value >> 4]);
++        result.push_back(digits[value & 15]);
++    }
++    return result;
++}
++
++std::string sha256_hex(std::span<const std::uint8_t> bytes) {
++    return qwen3_5::frontend::sha256_hex(qwen3_5::frontend::sha256(bytes));
++}
++
++struct ViewBinding {
++    BoundWeight* weight = nullptr;
++    std::uint64_t begin = 0;
++    std::uint64_t end = 0;
++    const WeightParent* parent = nullptr;
++};
++struct ParentBinding {
++    const WeightParent* parent = nullptr;
++    std::map<std::string, ViewBinding, std::less<>> views;
++};
++
++bool parse_gdn_qkv_name(std::string_view name, std::uint32_t& layer, std::string& role) {
++    constexpr std::string_view prefix = "text/layers/";
++    if (!name.starts_with(prefix)) { return false; }
++    const auto slash = name.find('/', prefix.size());
++    if (slash == std::string_view::npos ||
++        name.substr(slash) != "/gdn/query" && name.substr(slash) != "/gdn/key" &&
++        name.substr(slash) != "/gdn/value") { return false; }
++    const auto [end, error] = std::from_chars(name.data() + prefix.size(), name.data() + slash, layer);
++    if (error != std::errc{} || end != name.data() + slash) { return false; }
++    role.assign(name.substr(slash + std::string_view("/gdn/").size()));
++    return true;
++}
++
++std::pair<std::uint64_t, std::uint64_t> expected_range(std::string_view role) {
++    if (role == "query") { return {0, 2048ULL * kCols}; }
++    if (role == "key") { return {2048ULL * kCols, 4096ULL * kCols}; }
++    if (role == "value") { return {4096ULL * kCols, kElements}; }
++    throw std::invalid_argument("EdgeDense: unsupported GDN QKV role");
++}
++
++artifact::Shape expected_view_shape(std::string_view role) {
++    if (role == "query") { return {2048, kCols}; }
++    if (role == "key") { return {2048, kCols}; }
++    if (role == "value") { return {6144, kCols}; }
++    throw std::invalid_argument("EdgeDense: unsupported GDN QKV role");
++}
++
++std::uint64_t checked_u64(const Json& value, std::string_view label) {
++    if (!value.is_number_unsigned()) {
++        throw std::invalid_argument("EdgeDense: " + std::string(label) + " must be uint64");
++    }
++    return value.get<std::uint64_t>();
++}
++
++std::string required_string(const Json& object, std::string_view key) {
++    if (!object.contains(key) || !object.at(key).is_string()) {
++        throw std::invalid_argument("EdgeDense: manifest field '" + std::string(key) +
++                                    "' must be a string");
++    }
++    return object.at(key).get<std::string>();
++}
++
++} // namespace
++
++struct EdgeDenseSidecar::Entry {
++    std::string id;
++    // Destruction is reverse declaration order: unregister kernels before releasing their planes.
++    DeviceBuffer codes;
++    DeviceBuffer scales;
++    DeviceBuffer global;
++    std::shared_ptr<ops::edge_dense::Registration> registration;
++};
++
++EdgeDenseSidecar::EdgeDenseSidecar(const std::filesystem::path& directory,
++                                   const artifact::Reader& reader,
++                                   std::vector<BoundWeight>& bound, DeviceContext& device) {
++    const auto manifest_path = directory / "manifest.json";
++    std::ifstream manifest_file(manifest_path, std::ios::binary);
++    if (!manifest_file) {
++        throw std::runtime_error("cannot open EdgeDense manifest: " + manifest_path.string());
++    }
++    Json manifest;
++    try { manifest_file >> manifest; }
++    catch (const std::exception& error) {
++        throw std::runtime_error("invalid EdgeDense manifest: " + std::string(error.what()));
++    }
++    if (!manifest.is_object() || manifest.value("version", 0) != 1 ||
++        required_string(manifest, "artifact_id") != artifact_hex(reader.artifact_id()) ||
++        !manifest.contains("objects") || !manifest.at("objects").is_array()) {
++        throw std::invalid_argument("EdgeDense manifest does not match the loaded artifact");
++    }
++    const std::string cubin_name = required_string(manifest, "cubin");
++    if (cubin_name != kCubinName) {
++        throw std::invalid_argument("EdgeDense cubin must be " + std::string(kCubinName));
++    }
++    const auto cubin_path = directory / cubin_name;
++    if (!std::filesystem::is_regular_file(cubin_path)) {
++        throw std::invalid_argument("EdgeDense cubin is missing: " + cubin_path.string());
++    }
++    const std::string cubin_hash = required_string(manifest, "cubin_sha256");
++    if (cubin_hash.size() != 64 ||
++        !std::all_of(cubin_hash.begin(), cubin_hash.end(), [](unsigned char c) {
++            return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
++        })) {
++        throw std::invalid_argument("EdgeDense cubin_sha256 must be lowercase SHA-256 hex");
++    }
++    const auto cubin_bytes = std::filesystem::file_size(cubin_path);
++    if (cubin_bytes == 0 || cubin_bytes > 2 * 1024 * 1024) {
++        throw std::invalid_argument("EdgeDense cubin has an unexpected size");
++    }
++    std::vector<std::uint8_t> cubin_host(static_cast<std::size_t>(cubin_bytes));
++    {
++        std::ifstream cubin_file(cubin_path, std::ios::binary);
++        cubin_file.read(reinterpret_cast<char*>(cubin_host.data()),
++                        static_cast<std::streamsize>(cubin_host.size()));
++        if (cubin_file.gcount() != static_cast<std::streamsize>(cubin_host.size()) ||
++            sha256_hex(cubin_host) != cubin_hash) {
++            throw std::invalid_argument("EdgeDense cubin is truncated or has SHA-256 mismatch");
++        }
++    }
++    if (required_string(manifest, "target_layout") != kTargetLayout) {
++        throw std::invalid_argument("EdgeDense manifest target_layout is not the frozen TRT-Edge format");
++    }
++
++    // Resolve exact q/k/v logical slices back to their common encoded Q6 parent. We never infer
++    // identity from tensor names alone: all three source object IDs and WeightRegion parents must
++    // agree, and their explicit element intervals must tile the whole parent exactly.
++    std::map<std::string, ParentBinding, std::less<>> parents;
++    for (auto& weight : bound) {
++        std::uint32_t layer = 0;
++        std::string role;
++        if (!parse_gdn_qkv_name(weight.name, layer, role)) { continue; }
++        (void)layer;
++        if (weight.view.parts.empty()) { continue; }
++        const bool has_q6_parent = std::any_of(
++            weight.view.parts.begin(), weight.view.parts.end(), [](const auto& candidate) {
++                return candidate.parent && candidate.parent->geometry.format == QType::GGUF_Q6_K;
++            });
++        if (!has_q6_parent) { continue; }
++        if (weight.rank != 0 || weight.source_objects.size() != 1 || weight.view.parts.size() != 1) {
++            throw std::invalid_argument(weight.name + ": EdgeDense requires one rank-0 whole-parent slice");
++        }
++        auto& part = weight.view.parts.front();
++        if (!part.parent || weight.view.shape != expected_view_shape(role) ||
++            part.parent->geometry.format != QType::GGUF_Q6_K ||
++            part.parent->geometry.layout != QuantLayout::GgufBlocks ||
++            part.parent->geometry.shape.size() != 2 ||
++            part.parent->geometry.shape[1] != kCols ||
++            (part.parent->geometry.shape[0] != kRows && part.parent->geometry.shape[0] != 16384) ||
++            part.parent->geometry.elements != part.parent->geometry.shape[0] * kCols ||
++            part.parent->geometry.bytes != part.parent->geometry.shape[0] * kQ6BytesPerRow ||
++            part.begin >= part.end || part.end > kElements) {
++            throw std::invalid_argument(weight.name + ": source is not an expected Q6_K GDN parent/prefix");
++        }
++        const auto [want_begin, want_end] = expected_range(role);
++        if (part.begin != want_begin || part.end != want_end) {
++            throw std::invalid_argument(weight.name + ": source view has unexpected QKV row order/range");
++        }
++        auto& group = parents[weight.source_objects.front()];
++        if (group.parent && group.parent != part.parent) {
++            throw std::invalid_argument(weight.name + ": object id resolves to multiple parent buffers");
++        }
++        group.parent = part.parent;
++        if (!group.views.emplace(role, ViewBinding{&weight, part.begin, part.end, part.parent}).second) {
++            throw std::invalid_argument(weight.name + ": duplicate GDN QKV source view");
++        }
++    }
++    if (parents.size() != kExpectedParents) {
++        throw std::invalid_argument("EdgeDense expects 22 Q6_K GDN QKV parents, found " +
++                                    std::to_string(parents.size()));
++    }
++    for (const auto& [id, group] : parents) {
++        if (group.views.size() != 3 || !group.views.contains("query") ||
++            !group.views.contains("key") || !group.views.contains("value")) {
++            throw std::invalid_argument("EdgeDense parent " + id + ": q/k/v do not cover all views");
++        }
++        const auto& q = group.views.at("query");
++        const auto& k = group.views.at("key");
++        const auto& v = group.views.at("value");
++        if (q.begin != 0 || q.end != k.begin || k.end != v.begin || v.end != kElements ||
++            q.parent != k.parent || q.parent != v.parent || v.end != kElements) {
++            throw std::invalid_argument("EdgeDense parent " + id + ": q/k/v slices do not exactly cover the QKV prefix");
++        }
++    }
++
++    const auto& objects = manifest.at("objects");
++    if (objects.empty() || objects.size() > parents.size()) {
++        throw std::invalid_argument("EdgeDense manifest must select between 1 and 22 Q6 parents");
++    }
++    const std::uint64_t planned_bytes = objects.size() * kNvfp4Bytes;
++    constexpr std::uint64_t kRequiredFreeReserve = 4ULL * 1024 * 1024 * 1024;
++    {
++        DeviceBinding binding(device.rank(0).device);
++        if (device.free_bytes() < planned_bytes + kRequiredFreeReserve) {
++            throw std::runtime_error("EdgeDense sidecar refused: GPU free memory is below selected "
++                                    "payload plus 4 GiB reserve");
++        }
++    }
++    std::set<std::string> seen;
++    std::uint64_t total_bytes = 0;
++    entries_.reserve(parents.size());
++    for (const auto& item : objects) {
++        if (!item.is_object()) { throw std::invalid_argument("EdgeDense object entry must be an object"); }
++        const std::string id = required_string(item, "id");
++        const auto found = parents.find(id);
++        if (found == parents.end() || !seen.insert(id).second) {
++            throw std::invalid_argument("EdgeDense object id is unknown or duplicated: " + id);
++        }
++        if (!item.contains("shape") || item.at("shape") != Json::array({kRows, kCols})) {
++            throw std::invalid_argument("EdgeDense object " + id + ": expected shape [10240,2560]");
++        }
++        const auto& source_shape = item.at("source_shape");
++        const auto source_handle = reader.find(id);
++        const auto& source_object = reader.directory().tensor(source_handle);
++        const auto source_offset = checked_u64(item.at("source_offset"), "source_offset");
++        if (!source_shape.is_array() || source_shape.size() != 2 ||
++            checked_u64(source_shape[0], "source_shape[0]") != found->second.parent->geometry.shape[0] ||
++            checked_u64(source_shape[1], "source_shape[1]") != kCols ||
++            required_string(item, "source_format") != "gguf_q6_k" ||
++            required_string(item, "source_layout") != "gguf_blocks_v1" ||
++            checked_u64(item.at("source_parent_bytes"), "source_parent_bytes") != found->second.parent->geometry.bytes ||
++            source_object.shape != found->second.parent->geometry.shape ||
++            source_object.format != "gguf_q6_k" || source_object.layout != "gguf_blocks_v1" ||
++            source_object.bytes != found->second.parent->geometry.bytes ||
++            source_object.offset != source_offset ||
++            checked_u64(item.at("source_bytes"), "source_bytes") != kQ6Bytes ||
++            !item.contains("source_range") || !item.at("source_range").is_array() ||
++            item.at("source_range").size() != 2 ||
++            checked_u64(item.at("source_range")[0], "source_range begin") != 0 ||
++            checked_u64(item.at("source_range")[1], "source_range end") != kElements) {
++            throw std::invalid_argument("EdgeDense object " + id + ": source format/layout/extent mismatch");
++        }
++        const std::string source_hash = required_string(item, "source_sha256");
++        const auto valid_hash = [](std::string_view hash) {
++            return hash.size() == 64 && std::all_of(hash.begin(), hash.end(), [](unsigned char c) {
++                return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
++            });
++        };
++        if (!valid_hash(source_hash)) {
++            throw std::invalid_argument("EdgeDense object " + id + ": source_sha256 must be lowercase hex");
++        }
++        // Header ID is not a content digest: verify the exact original Q6 prefix too.
++        {
++            auto original = reader.read_range(source_offset, kQ6Bytes);
++            auto raw = std::span<const std::uint8_t>(
++                reinterpret_cast<const std::uint8_t*>(original.data()), original.size());
++            if (sha256_hex(raw) != source_hash) {
++                throw std::invalid_argument("EdgeDense source Q6 prefix SHA-256 mismatch: " + id);
++            }
++        }
++        if (!item.contains("runtime_bindings") || !item.at("runtime_bindings").is_array() ||
++            item.at("runtime_bindings").size() != 3) {
++            throw std::invalid_argument("EdgeDense object " + id + ": runtime_bindings must list query/key/value");
++        }
++        std::set<std::string> manifest_roles;
++        for (const auto& runtime_binding : item.at("runtime_bindings")) {
++            const auto name = required_string(runtime_binding, "name");
++            const auto found_binding = found->second.views.find(name.substr(name.rfind('/') + 1));
++            if (found_binding == found->second.views.end() || name != found_binding->second.weight->name ||
++                !runtime_binding.contains("range") || !runtime_binding.at("range").is_array() ||
++                runtime_binding.at("range").size() != 2 ||
++                checked_u64(runtime_binding.at("range")[0], "runtime binding range begin") != found_binding->second.begin ||
++                checked_u64(runtime_binding.at("range")[1], "runtime binding range end") != found_binding->second.end ||
++                !manifest_roles.insert(found_binding->first).second) {
++                throw std::invalid_argument("EdgeDense object " + id + ": runtime binding differs from artifact view");
++            }
++        }
++        if (manifest_roles.size() != 3) {
++            throw std::invalid_argument("EdgeDense object " + id + ": runtime binding set is incomplete");
++        }
++        const auto bytes = checked_u64(item.at("bytes"), "object bytes");
++        if (bytes != kNvfp4Bytes || total_bytes > kMaxTotalSidecarBytes - bytes) {
++            throw std::invalid_argument("EdgeDense object " + id + ": invalid payload extent/budget");
++        }
++        const std::string payload_name = required_string(item, "payload");
++        if (std::filesystem::path(payload_name).filename() != payload_name || payload_name.empty()) {
++            throw std::invalid_argument("EdgeDense payload must be a filename within its sidecar directory");
++        }
++        const std::string expected_hash = required_string(item, "sha256");
++        if (!valid_hash(expected_hash)) {
++            throw std::invalid_argument("EdgeDense object " + id + ": sha256 must be lowercase hex");
++        }
++        const auto payload_path = directory / payload_name;
++        std::ifstream payload(payload_path, std::ios::binary);
++        if (!payload) { throw std::runtime_error("cannot open EdgeDense payload " + payload_path.string()); }
++        payload.seekg(0, std::ios::end);
++        const auto end = payload.tellg();
++        if (end < 0 || static_cast<std::uint64_t>(end) != bytes) {
++            throw std::invalid_argument("EdgeDense payload byte length differs from manifest: " + id);
++        }
++        std::vector<std::uint8_t> host(static_cast<std::size_t>(bytes));
++        payload.seekg(0, std::ios::beg);
++        payload.read(reinterpret_cast<char*>(host.data()), static_cast<std::streamsize>(bytes));
++        if (payload.gcount() != static_cast<std::streamsize>(bytes) || sha256_hex(host) != expected_hash) {
++            throw std::invalid_argument("EdgeDense payload is truncated or has SHA-256 mismatch: " + id);
++        }
++        auto entry = std::make_unique<Entry>();
++        entry->id = id;
++        const auto* codes = host.data();
++        const auto* scales = codes + kCodesBytes;
++        const auto* global = scales + kScalesBytes;
++        float divisor = 0.0F;
++        std::memcpy(&divisor, global, sizeof(divisor));
++        if (!std::isfinite(divisor) || divisor <= 0.0F) {
++            throw std::invalid_argument("EdgeDense object " + id + ": FP32 global factor must be finite and positive");
++        }
++        {
++            DeviceBinding binding(device.rank(0).device);
++            entry->codes = DeviceBuffer(static_cast<std::size_t>(kCodesBytes));
++            entry->scales = DeviceBuffer(static_cast<std::size_t>(kScalesBytes));
++            entry->global = DeviceBuffer(static_cast<std::size_t>(kGlobalBytes));
++            entry->codes.copy_from_host(codes, static_cast<std::size_t>(kCodesBytes));
++            entry->scales.copy_from_host(scales, static_cast<std::size_t>(kScalesBytes));
++            entry->global.copy_from_host(global, static_cast<std::size_t>(kGlobalBytes));
++            entry->registration = ops::edge_dense::register_plane(
++                found->second.parent->data, entry->codes.p, entry->scales.p, entry->global.p, cubin_path);
++        }
++        if (!entry->registration) {
++            throw std::runtime_error("EdgeDense backend refused registration for parent " + id);
++        }
++        entries_.push_back(std::move(entry));
++        total_bytes += bytes;
++    }
++    if (seen.size() != objects.size() || total_bytes != objects.size() * kNvfp4Bytes) {
++        throw std::invalid_argument("EdgeDense manifest is incomplete or has an unexpected total extent");
++    }
++}
++
++EdgeDenseSidecar::~EdgeDenseSidecar() = default;
++EdgeDenseSidecar::EdgeDenseSidecar(EdgeDenseSidecar&&) noexcept = default;
++EdgeDenseSidecar& EdgeDenseSidecar::operator=(EdgeDenseSidecar&&) noexcept = default;
++
++std::size_t EdgeDenseSidecar::parent_count() const noexcept { return entries_.size(); }
++
++} // namespace ninfer::models::qwen4_exp

@@ -1,0 +1,117 @@
+diff --git a/bench/inference/ninfer_bench_support.h b/bench/inference/ninfer_bench_support.h
+--- a/bench/inference/ninfer_bench_support.h
++++ b/bench/inference/ninfer_bench_support.h
+@@ -73,6 +73,7 @@
+     SpeculativeOptions speculative;
+     ExpertResidency expert_residency = ExpertResidency::Device;
+     std::optional<std::uint64_t> expert_cache_bytes;
++    NgramTableOptions ngram_table;
+     HybridExpertOptions hybrid_experts; // --expert-dma-share, --expert-cpu-threads
+     int device                      = 0;
+     bool use_cuda_graph             = true;
+diff --git a/bench/inference/ninfer_bench_support.cpp b/bench/inference/ninfer_bench_support.cpp
+--- a/bench/inference/ninfer_bench_support.cpp
++++ b/bench/inference/ninfer_bench_support.cpp
+@@ -1,5 +1,6 @@
+ #include "ninfer_bench_support.h"
+ #include "product/hybrid_expert_options.h"
++#include "product/ngram_table_options.h"
+ #include "product/rope_yarn_options.h"
+ #include "product/speculative_options.h"
+ 
+@@ -323,6 +324,7 @@
+            "                              cache misses, the CPU computing the rest (default: "
+            "auto)\n"
+         << "  --expert-cpu-threads <N>    host or disk experts: CPU workers (default: automatic)\n"
++        << product::kNgramTableHelp
+         << "  --kv-dtype <bf16|int8|fp8|rk8v4|rk4v4|rk4v4-e8|rk2v4-e8|nvfp4|k8v4>  KV cache "
+            "storage "
+            "(default: bf16)\n"
+@@ -421,6 +423,11 @@
+         } else if ((arg == "--expert-dma-share" || arg == "--expert-cpu-threads") &&
+                    product::parse_hybrid_expert_option(arg, options.hybrid_experts,
+                                                        [&] { return value(argv[i]); })) {
++        } else if (product::parse_ngram_table_option(arg, options.ngram_table,
++                                                     [&] { return value(argv[i]); })) {
++            if (arg == "--ngram-table" && options.ngram_table.path.empty()) {
++                throw std::invalid_argument("--ngram-table must not be empty");
++            }
+         } else if (arg == "--fast-prefill-kernel") {
+             options.fast_prefill_kernel = true;
+         } else if (arg == "--spec") {
+diff --git a/bench/inference/ninfer_bench.cpp b/bench/inference/ninfer_bench.cpp
+--- a/bench/inference/ninfer_bench.cpp
++++ b/bench/inference/ninfer_bench.cpp
+@@ -164,6 +164,7 @@
+         engine_options.prefill_cublas_projections = options.prefill_cublas_projections;
+         engine_options.expert_residency           = options.expert_residency;
+         engine_options.expert_cache_bytes         = options.expert_cache_bytes;
++        engine_options.ngram_table                = options.ngram_table;
+         engine_options.hybrid_experts             = options.hybrid_experts;
+         engine_options.device_profile             = options.device_profile;
+         engine_options.device_profile_path        = options.device_profile_path;
+diff --git a/tests/test_ninfer_bench_support.cpp b/tests/test_ninfer_bench_support.cpp
+--- a/tests/test_ninfer_bench_support.cpp
++++ b/tests/test_ninfer_bench_support.cpp
+@@ -61,6 +61,61 @@
+ 
+ int test_cli_contract() {
+     int failures                  = 0;
++    bool ngram_cli_accepted       = true;
++    qb::BenchOptions ngram_options;
++    try {
++        ngram_options = parse_for_test({"ninfer_bench", "--weights", "model.ninfer",
++                                        "--ngram-table", "table.ninfer", "--ngram-residency",
++                                        "disk", "--ngram-io", "mmap", "--ngram-io-depth", "8"});
++    } catch (const std::invalid_argument&) { ngram_cli_accepted = false; }
++    failures += expect(ngram_cli_accepted,
++                       "bench accepts separate ngram table with mmap and IO depth");
++    failures += expect(ngram_options.ngram_table.path == "table.ninfer" &&
++                           ngram_options.ngram_table.residency == ninfer::NgramResidency::Disk &&
++                           ngram_options.ngram_table.io == ninfer::NgramIo::Mapped &&
++                           ngram_options.ngram_table.io_depth == 8,
++                       "bench stores native ngram path, residency, IO enum and depth");
++    const auto ngram_defaults = parse_for_test({"ninfer_bench", "--weights", "model.ninfer"});
++    failures += expect(ngram_defaults.ngram_table.path.empty() &&
++                           ngram_defaults.ngram_table.residency == ninfer::NgramResidency::Disk &&
++                           ngram_defaults.ngram_table.io == ninfer::NgramIo::Buffered &&
++                           ngram_defaults.ngram_table.io_depth == 64 &&
++                           !ngram_defaults.ngram_table.disabled,
++                       "bench ngram defaults preserve EngineOptions defaults");
++    for (const auto& args : std::vector<std::vector<std::string>>{
++             {"--ngram-residency", "invalid"}, {"--ngram-io", "invalid"},
++             {"--ngram-io-depth", "0"}, {"--ngram-io-depth", "1025"},
++             {"--ngram-io-depth", "1.5"}, {"--ngram-ram-mib", "1073741825"},
++             {"--ngram-table", ""}, {"--ngram-residency"}, {"--ngram-io"},
++             {"--ngram-io-depth"}, {"--ngram-hot-profile"}, {"--ngram-ram-mib"}}) {
++        failures += expect_throws<std::invalid_argument>(
++            [&] {
++                std::vector<std::string> command{"ninfer_bench", "--weights", "model.ninfer"};
++                command.insert(command.end(), args.begin(), args.end());
++                (void)parse_for_test(std::move(command));
++            },
++            "invalid benchmark ngram table option");
++    }
++    const auto ngram_ram = parse_for_test({"ninfer_bench", "--weights", "model.ninfer",
++                                           "--ngram-residency", "ram-hot", "--ngram-io",
++                                           "direct", "--ngram-io-depth", "1024",
++                                           "--ngram-hot-profile", "hot.profile",
++                                           "--ngram-ram-mib", "2048", "--ngram-lock"});
++    failures += expect(ngram_ram.ngram_table.residency == ninfer::NgramResidency::RamHot &&
++                           ngram_ram.ngram_table.io == ninfer::NgramIo::Direct &&
++                           ngram_ram.ngram_table.io_depth == 1024 &&
++                           ngram_ram.ngram_table.hot_profile == "hot.profile" &&
++                           ngram_ram.ngram_table.ram_budget_bytes ==
++                               std::optional<std::uint64_t>(2048ULL << 20) &&
++                           ngram_ram.ngram_table.lock,
++                       "bench exposes the shared NInfer ngram options without lossy parsing");
++    const auto no_table = parse_for_test(
++        {"ninfer_bench", "--weights", "model.ninfer", "--no-ngram-table"});
++    failures += expect(no_table.ngram_table.disabled, "bench exposes explicit table-disable mode");
++    failures += expect(qb::usage_text("ninfer_bench").find("--ngram-io buffered|direct|mmap") !=
++                           std::string::npos,
++                       "bench help includes table IO modes");
++
+     const qb::BenchOptions parsed = parse_for_test({
+         "ninfer_bench",
+         "--weights",

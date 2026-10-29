@@ -1,0 +1,533 @@
+diff --git a/include/ninfer/ops/mtp_draft_argmax.h b/include/ninfer/ops/mtp_draft_argmax.h
+new file mode 100644
+index 00000000..b30236be
+--- /dev/null
++++ b/include/ninfer/ops/mtp_draft_argmax.h
+@@ -0,0 +1,20 @@
++#pragma once
++
++#include "core/tensor.h"
++#include "ninfer/ops/sampling.h"
++
++#include <cstdint>
++#include <cuda_runtime.h>
++
++namespace ninfer::ops {
++
++// Side-effect-free greedy MTP proposal ranking for exactly one BF16 logits column.
++// `configs` is one device SamplingConfig; token_counts is read only. `overlay` contains
++// already-produced draft ids from this round and is read without updating committed counts.
++// `second` is optional and, when supplied, receives the runner-up under the same adjusted score.
++void mtp_draft_argmax(const Tensor& logits, Tensor& first, Tensor* second,
++                      const SamplingConfig* configs, const std::int32_t* overlay,
++                      std::int32_t overlay_len, std::int32_t valid_rows,
++                      cudaStream_t stream);
++
++} // namespace ninfer::ops
+diff --git a/src/models/qwen3_5/frontend/output_session.cpp b/src/models/qwen3_5/frontend/output_session.cpp
+index 490e4820..12d6fa2a 100644
+--- a/src/models/qwen3_5/frontend/output_session.cpp
++++ b/src/models/qwen3_5/frontend/output_session.cpp
+@@ -1149,6 +1149,10 @@ bool OutputSession::reasoning_closed() const noexcept {
+     return impl_ != nullptr && impl_->started_in_reasoning && !impl_->prefix_execution.tracking;
+ }
+ 
++bool OutputSession::reasoning_open() const noexcept {
++    return impl_ != nullptr && impl_->started_in_reasoning && impl_->prefix_execution.tracking;
++}
++
+ ThinkingBudgetStats OutputSession::thinking_stats() const noexcept {
+     if (impl_ == nullptr) { return {}; }
+     return ThinkingBudgetStats{
+diff --git a/src/models/qwen3_5/frontend/output_session.h b/src/models/qwen3_5/frontend/output_session.h
+index 209bc62c..8ccc6d4a 100644
+--- a/src/models/qwen3_5/frontend/output_session.h
++++ b/src/models/qwen3_5/frontend/output_session.h
+@@ -92,6 +92,7 @@ public:
+     [[nodiscard]] ThinkingBudgetStats thinking_stats() const noexcept;
+     // True once a session that began inside a reasoning block has committed its close.
+     [[nodiscard]] bool reasoning_closed() const noexcept;
++    [[nodiscard]] bool reasoning_open() const noexcept;
+     [[nodiscard]] std::optional<std::string> matched_stop_string() const;
+ 
+ private:
+diff --git a/src/models/qwen4_exp/executor.cpp b/src/models/qwen4_exp/executor.cpp
+index ab7951ed..97770586 100644
+--- a/src/models/qwen4_exp/executor.cpp
++++ b/src/models/qwen4_exp/executor.cpp
+@@ -18,6 +18,7 @@
+ #include "models/qwen4_exp/ngram_table.h"
+ #include "models/qwen3_5/execution/vision.h"
+ #include "ninfer/ops/argmax.h"
++#include "ninfer/ops/mtp_draft_argmax.h"
+ #include "ninfer/ops/cast.h"
+ #include "ninfer/ops/causal_conv1d_silu.h"
+ #include "ninfer/ops/embedding.h"
+@@ -3709,7 +3710,8 @@ struct Executor::Impl {
+     // final mixer, the head, and the argmax over the public tokens into `out` (device I32 [n],
+     // head rank).
+     void mtp_head(std::int32_t n, std::int32_t* out, std::int32_t* second = nullptr,
+-                  float* logprobs = nullptr) {
++                  float* logprobs = nullptr, const ops::SamplingConfig* draft_sampling = nullptr,
++                  const std::int32_t* overlay = nullptr, std::int32_t overlay_len = 0) {
+         RankState& rank      = ranks[model.head_rank()];
+         const cudaStream_t s = rank.stream;
+         WorkspaceArena& ws   = *rank.workspace;
+@@ -3725,7 +3727,16 @@ struct Executor::Impl {
+         Tensor logits(rank.logits, DType::BF16, {static_cast<std::int32_t>(config.vocab_size), n});
+         project(mtp->head, mixed, logits, ws, s);
+         Tensor tokens(out, DType::I32, {n});
+-        if (second) {
++        if (draft_sampling != nullptr) {
++            if (second) {
++                Tensor alternative(second, DType::I32, {n});
++                ops::mtp_draft_argmax(logits, tokens, &alternative, draft_sampling, overlay,
++                                      overlay_len, domain, s);
++            } else {
++                ops::mtp_draft_argmax(logits, tokens, nullptr, draft_sampling, overlay,
++                                      overlay_len, domain, s);
++            }
++        } else if (second) {
+             Tensor alternative(second, DType::I32, {n});
+             ops::argmax_top2(logits, tokens, alternative, domain, s);
+         } else {
+@@ -3787,7 +3798,8 @@ struct Executor::Impl {
+ 
+     std::uint32_t draft(std::span<const std::uint32_t> batch, std::span<const std::int32_t> anchors,
+                         std::span<std::int32_t> out, std::span<std::uint32_t> extents = {},
+-                        std::uint32_t steps = 0) {
++                        std::uint32_t steps = 0,
++                        const ops::SamplingConfig* draft_sampling = nullptr) {
+         require_mtp("draft");
+         const std::size_t b      = batch.size();
+         const std::size_t stride = options.draft_tokens;
+@@ -3796,6 +3808,9 @@ struct Executor::Impl {
+             (!extents.empty() && extents.size() != b) || k > stride) {
+             throw std::invalid_argument("qwen4_exp draft: one anchor and its drafts per sequence");
+         }
++        if (draft_sampling != nullptr && b != 1) {
++            throw std::invalid_argument("qwen4_exp draft: penalty-aware MTP proposal is single-row only");
++        }
+         std::vector<SequenceState*> drafting;
+         for (std::size_t j = 0; j < b; ++j) {
+             SequenceState* sequence = &sequences.at(batch[j]);
+@@ -3856,7 +3871,9 @@ struct Executor::Impl {
+                 stage_hidden(rank.stack, n, 0);
+             }
+             mtp_pass(parts, n, ids + i * b, at + i * b, true);
+-            mtp_head(n, ids + (i + 1) * b, second(i), confidence ? confidence + i * b : nullptr);
++            mtp_head(n, ids + (i + 1) * b, second(i), confidence ? confidence + i * b : nullptr,
++                     draft_sampling, draft_sampling && i != 0 ? ids + b : nullptr,
++                     draft_sampling ? static_cast<std::int32_t>(i) : 0);
+         };
+         const auto prefetch = [&](std::size_t i) {
+             if (draft_prefetch) {
+@@ -4389,8 +4406,9 @@ void Executor::stop_drafting(std::uint32_t sequence) {
+ 
+ std::uint32_t Executor::draft(std::span<const std::uint32_t> sequences,
+                               std::span<const std::int32_t> anchors, std::span<std::int32_t> out,
+-                              std::span<std::uint32_t> extents, std::uint32_t steps) {
+-    return impl_->draft(sequences, anchors, out, extents, steps);
++                              std::span<std::uint32_t> extents, std::uint32_t steps,
++                              const ops::SamplingConfig* draft_sampling) {
++    return impl_->draft(sequences, anchors, out, extents, steps, draft_sampling);
+ }
+ 
+ void Executor::verify(std::span<const std::uint32_t> sequences,
+diff --git a/src/models/qwen4_exp/executor.h b/src/models/qwen4_exp/executor.h
+index bee857d1..8d54dabb 100644
+--- a/src/models/qwen4_exp/executor.h
++++ b/src/models/qwen4_exp/executor.h
+@@ -21,6 +21,7 @@
+ #include "core/device.h"
+ #include "core/tensor.h"
+ #include "ninfer/ops/rope.h"
++#include "ninfer/ops/sampling.h"
+ #include "ninfer/engine_options.h"
+ #include "ninfer/kv_cache_storage.h"
+ #include "ninfer/observability/resources.h"
+@@ -243,7 +244,8 @@ public:
+     // row's entries past the steps run are -1).
+     std::uint32_t draft(std::span<const std::uint32_t> sequences,
+                         std::span<const std::int32_t> anchors, std::span<std::int32_t> out,
+-                        std::span<std::uint32_t> extents = {}, std::uint32_t steps = 0);
++                        std::span<std::uint32_t> extents = {}, std::uint32_t steps = 0,
++                        const ops::SamplingConfig* draft_sampling = nullptr);
+     // Runs 2..draft_tokens() + 1 tokens of each sequence (its anchor, then its drafts) at its next
+     // positions without committing them, and leaves the logits of every token in logits(), one
+     // column per token, sequence after sequence. The sequences' positions and states stay where
+diff --git a/src/ops/basic_sources.cmake b/src/ops/basic_sources.cmake
+index 7a13bdac..34d9a1c7 100644
+--- a/src/ops/basic_sources.cmake
++++ b/src/ops/basic_sources.cmake
+@@ -22,6 +22,7 @@ target_sources(ninfer_ops PRIVATE
+   "${CMAKE_CURRENT_LIST_DIR}/launcher/layer_norm.cu"
+   "${CMAKE_CURRENT_LIST_DIR}/launcher/logprob_topk.cu"
+   "${CMAKE_CURRENT_LIST_DIR}/launcher/mtp_pack.cu"
++  "${CMAKE_CURRENT_LIST_DIR}/launcher/mtp_draft_argmax.cu"
+   "${CMAKE_CURRENT_LIST_DIR}/launcher/mtp_round.cu"
+   "${CMAKE_CURRENT_LIST_DIR}/launcher/speculative_round.cu"
+   "${CMAKE_CURRENT_LIST_DIR}/launcher/paged_kv_window.cu"
+@@ -52,6 +53,7 @@ target_sources(ninfer_ops PRIVATE
+   "${CMAKE_CURRENT_LIST_DIR}/wrapper/layer_norm.cpp"
+   "${CMAKE_CURRENT_LIST_DIR}/wrapper/logprob_topk.cpp"
+   "${CMAKE_CURRENT_LIST_DIR}/wrapper/mtp_pack.cpp"
++  "${CMAKE_CURRENT_LIST_DIR}/wrapper/mtp_draft_argmax.cpp"
+   "${CMAKE_CURRENT_LIST_DIR}/wrapper/mtp_round.cpp"
+   "${CMAKE_CURRENT_LIST_DIR}/wrapper/speculative_round.cpp"
+   "${CMAKE_CURRENT_LIST_DIR}/wrapper/paged_kv_window.cpp"
+diff --git a/src/ops/launcher/mtp_draft_argmax.cu b/src/ops/launcher/mtp_draft_argmax.cu
+new file mode 100644
+index 00000000..4a68ffae
+--- /dev/null
++++ b/src/ops/launcher/mtp_draft_argmax.cu
+@@ -0,0 +1,62 @@
++#include "ninfer/ops/mtp_draft_argmax.h"
++#include "ops/launcher/mtp_draft_argmax.h"
++#include "core/device.h"
++#include "ops/kernel/sampling_device.cuh"
++
++#include <climits>
++
++namespace ninfer::ops::detail {
++namespace {
++constexpr int kDraftBlock = kSamplerBlock;
++
++__device__ __forceinline__ void insert(float value, int id, float& a, int& ai, float& b, int& bi) {
++    if (sampling_better(value, id, a, ai)) { b = a; bi = ai; a = value; ai = id; }
++    else if (id != ai && sampling_better(value, id, b, bi)) { b = value; bi = id; }
++}
++
++__global__ void mtp_draft_argmax_kernel(const __nv_bfloat16* logits, int* first, int* second,
++                                        const SamplingConfig* configs, const int* overlay,
++                                        int overlay_len, int valid_rows, int physical_rows) {
++    const SamplingConfig cfg = configs[0];
++    float a = -CUDART_INF_F, b = -CUDART_INF_F;
++    int ai = INT_MAX, bi = INT_MAX;
++    for (int id = static_cast<int>(threadIdx.x); id < valid_rows; id += blockDim.x) {
++        const float raw = __bfloat162float(logits[id]);
++        const float score = sampling_adjusted_logit(raw, id, cfg, overlay, overlay_len);
++        insert(score, id, a, ai, b, bi);
++    }
++    __shared__ float av[kDraftBlock], bv[kDraftBlock];
++    __shared__ int aid[kDraftBlock], bid[kDraftBlock];
++    av[threadIdx.x] = a; aid[threadIdx.x] = ai;
++    bv[threadIdx.x] = b; bid[threadIdx.x] = bi;
++    __syncthreads();
++    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
++        if (threadIdx.x < stride) {
++            float na = av[threadIdx.x], nb = bv[threadIdx.x];
++            int nai = aid[threadIdx.x], nbi = bid[threadIdx.x];
++            insert(av[threadIdx.x + stride], aid[threadIdx.x + stride], na, nai, nb, nbi);
++            insert(bv[threadIdx.x + stride], bid[threadIdx.x + stride], na, nai, nb, nbi);
++            av[threadIdx.x] = na; aid[threadIdx.x] = nai;
++            bv[threadIdx.x] = nb; bid[threadIdx.x] = nbi;
++        }
++        __syncthreads();
++    }
++    if (threadIdx.x == 0) {
++        first[0] = aid[0];
++        if (second != nullptr) { second[0] = bid[0]; }
++    }
++    (void)physical_rows;
++}
++} // namespace
++
++void mtp_draft_argmax_launch(const Tensor& logits, Tensor& first, Tensor* second,
++                             const SamplingConfig* configs, const std::int32_t* overlay,
++                             std::int32_t overlay_len, std::int32_t valid_rows,
++                             cudaStream_t stream) {
++    mtp_draft_argmax_kernel<<<1, kDraftBlock, 0, stream>>>(
++        static_cast<const __nv_bfloat16*>(logits.data), static_cast<int*>(first.data),
++        second == nullptr ? nullptr : static_cast<int*>(second->data), configs, overlay,
++        overlay_len, valid_rows, static_cast<int>(logits.ne[0]));
++    CUDA_CHECK(cudaGetLastError());
++}
++} // namespace ninfer::ops::detail
+diff --git a/src/ops/launcher/mtp_draft_argmax.h b/src/ops/launcher/mtp_draft_argmax.h
+new file mode 100644
+index 00000000..e55b02f6
+--- /dev/null
++++ b/src/ops/launcher/mtp_draft_argmax.h
+@@ -0,0 +1,10 @@
++#pragma once
++#include "core/tensor.h"
++#include "ninfer/ops/sampling.h"
++#include <cuda_runtime.h>
++namespace ninfer::ops::detail {
++void mtp_draft_argmax_launch(const Tensor& logits, Tensor& first, Tensor* second,
++                             const SamplingConfig* configs, const std::int32_t* overlay,
++                             std::int32_t overlay_len, std::int32_t valid_rows,
++                             cudaStream_t stream);
++}
+diff --git a/src/ops/wrapper/mtp_draft_argmax.cpp b/src/ops/wrapper/mtp_draft_argmax.cpp
+new file mode 100644
+index 00000000..e0353fea
+--- /dev/null
++++ b/src/ops/wrapper/mtp_draft_argmax.cpp
+@@ -0,0 +1,32 @@
++#include "ninfer/ops/mtp_draft_argmax.h"
++#include "ops/launcher/mtp_draft_argmax.h"
++
++#include <stdexcept>
++
++namespace ninfer::ops {
++
++void mtp_draft_argmax(const Tensor& logits, Tensor& first, Tensor* second,
++                      const SamplingConfig* configs, const std::int32_t* overlay,
++                      std::int32_t overlay_len, std::int32_t valid_rows,
++                      cudaStream_t stream) {
++    if (logits.dtype != DType::BF16 || !logits.is_contiguous() || logits.ne[1] != 1 ||
++        logits.ne[2] != 1 || logits.ne[3] != 1 || valid_rows <= 0 ||
++        valid_rows > logits.ne[0] || logits.data == nullptr) {
++        throw std::invalid_argument("mtp_draft_argmax: expected contiguous BF16 [vocab,1]");
++    }
++    const auto valid_output = [](const Tensor& out) {
++        return out.dtype == DType::I32 && out.is_contiguous() && out.ne[0] == 1 &&
++               out.ne[1] == 1 && out.ne[2] == 1 && out.ne[3] == 1 && out.data != nullptr;
++    };
++    if (!valid_output(first) || (second != nullptr && !valid_output(*second)) ||
++        (second != nullptr && second->data == first.data)) {
++        throw std::invalid_argument("mtp_draft_argmax: outputs must be distinct I32 scalars");
++    }
++    if (configs == nullptr || overlay_len < 0 || (overlay_len > 0 && overlay == nullptr)) {
++        throw std::invalid_argument("mtp_draft_argmax: invalid device config or overlay");
++    }
++    detail::mtp_draft_argmax_launch(logits, first, second, configs, overlay, overlay_len,
++                                    valid_rows, stream);
++}
++
++} // namespace ninfer::ops
+diff --git a/src/runtime/engine/qwen4_exp_core.cpp b/src/runtime/engine/qwen4_exp_core.cpp
+index 15a54b35..b2548c7d 100644
+--- a/src/runtime/engine/qwen4_exp_core.cpp
++++ b/src/runtime/engine/qwen4_exp_core.cpp
+@@ -36,6 +36,7 @@
+ #include <bit>
+ #include <condition_variable>
+ #include <cstdio>
++#include <cstdlib>
+ #include <cstring>
+ #include <deque>
+ #include <fstream>
+@@ -67,6 +68,14 @@ double seconds(Clock::time_point from, Clock::time_point to) {
+     return std::chrono::duration<double>(to - from).count();
+ }
+ 
++bool mtp_penalty_proposal_opted_in() {
++    static const bool enabled = [] {
++        const char* value = std::getenv("NINFER_QWEN4_MTP_PENALTY_PROPOSAL");
++        return value != nullptr && std::strcmp(value, "1") == 0;
++    }();
++    return enabled;
++}
++
+ // Requests fail alone on their own errors; anything else may have left the device in an unknown
+ // state, so it fails the Engine.
+ bool request_error(const std::exception_ptr& error) {
+@@ -511,6 +520,7 @@ struct Qwen4ExpCore::Impl {
+     const bool reuse_prefixes;
+     const std::uint32_t drafts; // MTP drafts a speculative round proposes; 0 without speculation
+     const std::uint32_t lookup_ngram; // --lookup-ngram: tokens a context lookup matches; 0 is off
++    const float draft_min_p;
+     const DiagnosticObserver diagnostics;
+     // With --adaptive-mtp, the steps a round drafts and verifies: from one draft, since each draft
+     // is a step of the MTP block of its own here, up to `drafts`.
+@@ -599,7 +609,8 @@ struct Qwen4ExpCore::Impl {
+           domain(i.model->resources().public_token_count),
+           structured_output(options.structured_output),
+           reuse_prefixes(options.context_cache.enabled), drafts(i.executor->draft_tokens()),
+-          lookup_ngram(options.speculative.lookup_ngram), diagnostics(options.diagnostic_observer),
++          lookup_ngram(options.speculative.lookup_ngram),
++          draft_min_p(options.speculative.draft_min_p), diagnostics(options.diagnostic_observer),
+           slots(i.executor->options().sequences),
+           decode_rounds_per_prefill(
+               options.decode_rounds_per_prefill != 0
+@@ -2336,6 +2347,9 @@ struct Qwen4ExpCore::Impl {
+     void speculative_round(const std::vector<std::shared_ptr<Request>>& batch) {
+         auto& executor      = *instance.executor;
+         const std::size_t b = batch.size();
++        std::vector<SampleRow> rows;
++        rows.reserve(b);
++        for (const auto& request : batch) { rows.push_back(sample_row(*request)); }
+         std::vector<std::uint32_t> sequences;
+         std::vector<TokenId> anchors;
+         for (const auto& request : batch) {
+@@ -2401,7 +2415,46 @@ struct Qwen4ExpCore::Impl {
+             }
+             std::vector<TokenId> mtp_drafts(mtp_sequences.size() * drafts);
+             std::vector<std::uint32_t> mtp_extents(mtp_sequences.size(), steps);
+-            mtp_steps = executor.draft(mtp_sequences, mtp_anchors, mtp_drafts, mtp_extents, steps);
++            const SampleRow& row = rows.front();
++            const auto& sampling = *row.params;
++            const bool penalty_proposal =
++                mtp_penalty_proposal_opted_in() && b == 1 && mtp_sequences.size() == 1 &&
++                lookups == 0 && lookup_ngram == 0 && !batch.front()->constrained &&
++                !batch.front()->post_thinking &&
++                !batch.front()->output.reasoning_open() &&
++                batch.front()->output.reasoning_tokens() == 0 &&
++                !batch.front()->options.execution.post_thinking_sampling &&
++                sampling.temperature == 0.0f && sampling.presence_penalty != 0.0f &&
++                std::isfinite(sampling.presence_penalty) &&
++                std::isfinite(sampling.frequency_penalty) &&
++                draft_min_p == 0.0f;
++            const ops::SamplingConfig* draft_sampling = nullptr;
++            if (penalty_proposal) {
++                RankBinding proposal_bind(device, executor.head_rank());
++                ops::SamplingConfig config;
++                config.temperature       = sampling.temperature;
++                config.top_k             = sampling.top_k;
++                config.top_p             = sampling.top_p;
++                config.min_p             = sampling.min_p;
++                config.presence_penalty  = sampling.presence_penalty;
++                config.frequency_penalty = sampling.frequency_penalty;
++                config.seed              = sampling.seed;
++                config.token_counts      = row.counts
++                    ? static_cast<std::int32_t*>(token_counts.p) + std::size_t(row.slot) * domain
++                    : nullptr;
++                auto* staged_config = static_cast<ops::SamplingConfig*>(host_sample->data());
++                staged_config[0] = config;
++                CUDA_CHECK(cudaMemcpyAsync(sample_config.p, staged_config, sizeof(config),
++                                           cudaMemcpyHostToDevice, executor.head_stream()));
++                draft_sampling = static_cast<const ops::SamplingConfig*>(sample_config.p);
++                static std::once_flag logged;
++                std::call_once(logged, [] {
++                    std::fprintf(stderr,
++                        "NInfer: penalty-aware MTP proposal enabled for eligible greedy rows; target verifier unchanged.\n");
++                });
++            }
++            mtp_steps = executor.draft(mtp_sequences, mtp_anchors, mtp_drafts, mtp_extents,
++                                       steps, draft_sampling);
+             for (std::size_t j = 0, m = 0; j < b; ++j) {
+                 if (looked_up[j]) { continue; }
+                 std::copy_n(mtp_drafts.begin() + std::ptrdiff_t(m * drafts), drafts,
+@@ -2439,8 +2492,6 @@ struct Qwen4ExpCore::Impl {
+ 
+         RankBinding bind(device, executor.head_rank());
+         const cudaStream_t stream = executor.head_stream();
+-        std::vector<SampleRow> rows;
+-        for (const auto& request : batch) { rows.push_back(sample_row(*request)); }
+         // The rows' sampling, each column of a structured row masked as its drafts before it leave
+         // the grammar. A row whose grammar cannot serve samples unmasked and fails after the round.
+         auto* configs = static_cast<ops::SamplingConfig*>(host_sample->data());
+diff --git a/tests/ops/test_mtp_draft_argmax.cpp b/tests/ops/test_mtp_draft_argmax.cpp
+new file mode 100644
+index 00000000..c6db08ca
+--- /dev/null
++++ b/tests/ops/test_mtp_draft_argmax.cpp
+@@ -0,0 +1,103 @@
++#include "ninfer/ops/mtp_draft_argmax.h"
++#include "core/device.h"
++#include "ops/op_tester.h"
++#include <algorithm>
++#include <cmath>
++#include <cstdint>
++#include <iostream>
++#include <vector>
++
++using namespace ninfer;
++using namespace ninfer::test;
++
++namespace {
++struct Pair { float value; int id; };
++bool better(Pair a, Pair b) { return a.value > b.value || (a.value == b.value && a.id < b.id); }
++
++std::pair<int, int> oracle(const std::vector<std::uint16_t>& logits,
++                           const std::vector<std::int32_t>& counts,
++                           const ops::SamplingConfig& cfg,
++                           const std::vector<std::int32_t>& overlay) {
++    Pair first{-INFINITY, 0}, second{-INFINITY, 0};
++    for (int id = 0; id < static_cast<int>(logits.size()); ++id) {
++        const float raw = bf16_to_f32(logits[id]);
++        float value = raw;
++        if (std::isfinite(raw)) {
++            const int count = counts[id] + static_cast<int>(std::count(overlay.begin(), overlay.end(), id));
++            if (count > 0) value -= cfg.presence_penalty;
++            value -= cfg.frequency_penalty * static_cast<float>(count);
++        }
++        Pair c{value, id};
++        if (better(c, first)) { second = first; first = c; }
++        else if (id != first.id && better(c, second)) { second = c; }
++    }
++    return {first.id, second.id};
++}
++
++int run_case(std::vector<std::uint16_t> logits, std::vector<std::int32_t> counts,
++             ops::SamplingConfig cfg, std::vector<std::int32_t> overlay, bool graph_replay) {
++    const int vocab = static_cast<int>(logits.size());
++    GuardedDeviceBuffer x(logits.size() * 2), c(counts.size() * 4), cfg_dev(sizeof(cfg));
++    GuardedDeviceBuffer ov(std::max<std::size_t>(1, overlay.size()) * 4);
++    GuardedDeviceBuffer first(4), second(4);
++    x.copy_from_host(logits.data(), x.bytes());
++    c.copy_from_host(counts.data(), c.bytes());
++    cfg.token_counts = static_cast<std::int32_t*>(c.data());
++    cfg_dev.copy_from_host(&cfg, sizeof(cfg));
++    if (!overlay.empty()) ov.copy_from_host(overlay.data(), overlay.size() * 4);
++    Tensor logits_t(x.data(), DType::BF16, {vocab, 1});
++    Tensor first_t(first.data(), DType::I32, {1}), second_t(second.data(), DType::I32, {1});
++    const auto invoke = [&](cudaStream_t stream) {
++        ops::mtp_draft_argmax(logits_t, first_t, &second_t,
++            static_cast<const ops::SamplingConfig*>(cfg_dev.data()),
++            overlay.empty() ? nullptr : static_cast<const std::int32_t*>(ov.data()),
++            static_cast<std::int32_t>(overlay.size()), vocab, stream);
++    };
++    invoke(nullptr); cuda_synchronize();
++    int failures = 0;
++    const auto verify = [&] {
++        const auto exp = oracle(logits, counts, cfg, overlay);
++        failures += verify_exact("MTP penalty top1", from_device<std::int32_t>(first.data(), 1),
++                                 std::vector<std::int32_t>{exp.first});
++        failures += verify_exact("MTP penalty top2", from_device<std::int32_t>(second.data(), 1),
++                                 std::vector<std::int32_t>{exp.second});
++        failures += verify_exact("MTP draft leaves committed counts unchanged",
++                                 from_device<std::int32_t>(c.data(), counts.size()), counts);
++    };
++    verify();
++    if (graph_replay) {
++        cudaStream_t s{}; cudaGraph_t g{}; cudaGraphExec_t ge{};
++        CUDA_CHECK(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
++        CUDA_CHECK(cudaStreamBeginCapture(s, cudaStreamCaptureModeGlobal));
++        invoke(s);
++        CUDA_CHECK(cudaStreamEndCapture(s, &g));
++        CUDA_CHECK(cudaGraphInstantiate(&ge, g, nullptr, nullptr, 0));
++        for (int r = 0; r < 2; ++r) {
++            counts[r ? 4 : 1] = r ? 1 : 2;
++            overlay = r ? std::vector<std::int32_t>{4, 2} : std::vector<std::int32_t>{1, 3};
++            cfg.presence_penalty = r ? 0.75f : 2.0f;
++            cfg.frequency_penalty = r ? 0.5f : 0.25f;
++            c.copy_from_host(counts.data(), c.bytes());
++            ov.copy_from_host(overlay.data(), overlay.size() * 4);
++            cfg_dev.copy_from_host(&cfg, sizeof(cfg));
++            CUDA_CHECK(cudaGraphLaunch(ge, s)); CUDA_CHECK(cudaStreamSynchronize(s));
++            verify();
++        }
++        CUDA_CHECK(cudaGraphExecDestroy(ge)); CUDA_CHECK(cudaGraphDestroy(g)); CUDA_CHECK(cudaStreamDestroy(s));
++    }
++    return failures;
++}
++} // namespace
++
++int main() {
++    if (cuda_unavailable()) { std::cout << "SKIP: no usable CUDA device\n"; return 77; }
++    std::vector<std::uint16_t> logits;
++    for (float v : {1.f, 4.f, 3.f, 2.f, 5.f, 0.f, 4.f, -1.f}) logits.push_back(f32_to_bf16(v));
++    std::vector<std::int32_t> counts(8, 0); counts[4] = 1;
++    ops::SamplingConfig cfg; cfg.presence_penalty = 1.5f; cfg.frequency_penalty = 0.25f;
++    int failures = run_case(logits, counts, cfg, {4, 4}, true);
++    cfg.presence_penalty = cfg.frequency_penalty = 0.0f;
++    failures += run_case(logits, counts, cfg, {}, false);
++    std::cout << (failures ? "FAIL" : "OK") << " MTP draft penalty argmax\n";
++    return failures ? 1 : 0;
++}
+diff --git a/tests/ops/tests.cmake b/tests/ops/tests.cmake
+index 8f96b6cf..77747f2f 100644
+--- a/tests/ops/tests.cmake
++++ b/tests/ops/tests.cmake
+@@ -25,6 +25,7 @@ set(ninfer_op_tests
+   layer_norm
+   embedding
+   argmax
++  mtp_draft_argmax
+   gdn_gating
+   gdn_gating_proj
+   rope

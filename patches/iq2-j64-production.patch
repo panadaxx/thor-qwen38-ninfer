@@ -1,0 +1,204 @@
+--- a/src/ops/linear/gguf/ggml_bridge.cu
++++ b/src/ops/linear/gguf/ggml_bridge.cu
+@@ -5,6 +5,7 @@
+ #include "core/profile_cupti_range.h"
+ #include "ggml_bridge_occ2.h"
+ #include "ggml_bridge_iq2s_occ2.h"
++#include "ggml_bridge_iq2s_j64_occ2.h"
+ #include "ggml_bridge_iq3_xxs_occ2.h"
+ #include "ggml_bridge_iq3_s_occ2.h"
+ #if defined(NINFER_THOR_IQ4NL_ROWOWNED)
+@@ -1044,6 +1045,8 @@
+         NINFER_GGUF_MOE_MATRIX_CASE(IQ2_XXS);
+         NINFER_GGUF_MOE_MATRIX_CASE(IQ2_XS);
+     case GgmlType::IQ2_S:
++        if (detail::try_moe_iq2s_sm110_j64_occ2(table, routing, max_active, pairs, tail,
++                                                activation, out, stream)) return;
+         if (detail::try_moe_iq2s_sm110_occ2(table, routing, max_active, pairs, tail,
+                                             activation, out, stream)) return;
+         detail::moe_matrix_product_impl<GGML_TYPE_IQ2_S>(table.experts, table.row_bytes,
+--- a/src/ops/linear/gguf/sources.cmake
++++ b/src/ops/linear/gguf/sources.cmake
+@@ -82,6 +82,7 @@
+ target_sources(ninfer_ggml_quants PRIVATE "${CMAKE_CURRENT_LIST_DIR}/ggml_mmq_iq4nl_occ2.cu")
+ 
+ target_sources(ninfer_ggml_quants PRIVATE "${CMAKE_CURRENT_LIST_DIR}/ggml_mmq_iq2s_occ2.cu")
++target_sources(ninfer_ggml_quants PRIVATE "${CMAKE_CURRENT_LIST_DIR}/ggml_mmq_iq2s_j64_occ2.cu")
+ 
+ option(NINFER_ENABLE_THOR_IQ4NL_U_HIST "Compile opt-in IQ4_NL active-expert histogram observer" OFF)
+ set(NINFER_THOR_IQ4NL_U_HIST_DIR "" CACHE PATH "Path to the isolated IQ4_NL U histogram observer")
+--- /dev/null
++++ b/src/ops/linear/gguf/ggml_bridge_iq2s_j64_occ2.h
+@@ -0,0 +1,9 @@
++// SPDX-License-Identifier: Apache-2.0
++#pragma once
++#include "ggml_bridge.h"
++#include <cstdint>
++namespace ninfer::ops::gguf::detail {
++bool try_moe_iq2s_sm110_j64_occ2(const MoeTable&, const MoeRouting&, int max_active, int pairs,
++                              bool tail, const void* activation, float* out, cudaStream_t stream);
++std::uint64_t sm110_iq2s_j64_occ2_launch_count_for_test() noexcept;
++}
+--- /dev/null
++++ b/src/ops/linear/gguf/ggml_mmq_iq2s_j64_occ2.cu
+@@ -0,0 +1,160 @@
++// SPDX-License-Identifier: Apache-2.0
++// Isolated production dispatch for a Thor-measured variant of GGML's IQ2_S J64 MoE MMQ.
++// Kernel body is copied from the pinned GGML bridge; only launch_bounds changes to 2 CTAs/SM.
++#include "ggml_bridge_iq2s_j64_occ2.h"
++#include "ggml_bridge_internal.cuh"
++#include "ggml_bridge_mmq.cuh"
++
++#include <array>
++#include <cstdio>
++#include <cstdlib>
++#include <atomic>
++#include <mutex>
++
++namespace ninfer::ops::gguf::detail {
++namespace {
++
++std::atomic<std::uint64_t> g_occ2_launch_count{0};
++
++
++__launch_bounds__(ggml_cuda_mmq_get_nthreads(GGML_TYPE_IQ2_S, 64, false), 2) static __global__
++void moe_mul_mat_q_iq2s_j64_occ2(const void* const* __restrict__ experts, const int* __restrict__ y,
++        const std::int32_t* __restrict__ sorted, const std::int32_t* __restrict__ bounds,
++        const std::int32_t* __restrict__ tiles, const std::int32_t* __restrict__ tile_count,
++        float* __restrict__ dst, const uint3 blocks_per_row, int rows, int stride_row_x, int ncols_y) {
++    constexpr ggml_type type = GGML_TYPE_IQ2_S;
++    constexpr int J = 64;
++    if (ggml_cuda_mmq_get_config(type, J, false).type == GGML_TYPE_COUNT) { NO_DEVICE_CODE; return; }
++    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
++    constexpr int nwarps = ggml_cuda_mmq_get_nthreads(type, J, false) / warp_size;
++    constexpr int I = ggml_cuda_mmq_get_I(type, J, false);
++    if (int(blockIdx.y) >= *tile_count) return;
++    const int tile = tiles[blockIdx.y];
++    const int expert = tile & 0xFFFF;
++    const int jt = tile >> 16;
++    const int col_low = bounds[expert];
++    const int col_diff = bounds[expert + 1] - col_low;
++    const int it = blockIdx.x;
++    extern __shared__ int ids_dst_shared[];
++#pragma unroll
++    for (int j0 = 0; j0 < J; j0 += nwarps * warp_size) {
++        const int j = j0 + threadIdx.y * warp_size + threadIdx.x;
++        if (j0 + nwarps * warp_size > J && j >= J) break;
++        ids_dst_shared[j] = jt * J + j < col_diff ? sorted[col_low + jt * J + j] : 0;
++    }
++    __syncthreads();
++    const int offset_y = (col_low + jt * J) * int(sizeof(block_q8_1_mmq) / sizeof(int));
++    const int tile_x_max_i = rows - it * I - 1;
++    const int tile_y_max_j = col_diff - jt * J - 1;
++    mul_mat_q_process_tile<type, J, false, false, GGML_PREC_Q8>(
++        static_cast<const char*>(experts[expert]), it * I * stride_row_x, y + offset_y,
++        ids_dst_shared, dst + it * I, nullptr, nullptr, stride_row_x, ncols_y, rows,
++        tile_x_max_i, tile_y_max_j, 0, blocks_per_row.z);
++}
++
++struct RuntimeKernelInfo {
++    int active_blocks = 0;
++    int registers = 0;
++    std::size_t local_bytes = 0;
++};
++
++const RuntimeKernelInfo& runtime_kernel_info(int device, const ggml_cuda_mmq_config& config,
++                                             std::size_t shared) {
++    static std::array<RuntimeKernelInfo, 16> info{};
++    static std::array<std::once_flag, 16> once{};
++    std::call_once(once[device], [&] {
++        check(cudaFuncSetAttribute(moe_mul_mat_q_iq2s_j64_occ2,
++                                   cudaFuncAttributeMaxDynamicSharedMemorySize,
++                                   static_cast<int>(shared)),
++              "IQ2_S J64 occupancy-2 dynamic shared memory");
++        check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&info[device].active_blocks,
++              moe_mul_mat_q_iq2s_j64_occ2, config.nthreads, shared), "IQ2_S J64 occupancy-2 query");
++        cudaFuncAttributes attributes{};
++        check(cudaFuncGetAttributes(&attributes, moe_mul_mat_q_iq2s_j64_occ2),
++              "IQ2_S J64 occupancy-2 function attributes");
++        info[device].registers = attributes.numRegs;
++        info[device].local_bytes = attributes.localSizeBytes;
++    });
++    return info[device];
++}
++
++
++bool enabled() {
++    const char* value = std::getenv("NINFER_SM110_IQ2S_J64_OCC2");
++    return value != nullptr && value[0] == '1' && value[1] == '\0';
++}
++
++} // namespace
++
++bool try_moe_iq2s_sm110_j64_occ2(const MoeTable& table, const MoeRouting& routing,
++                              int max_active, int pairs, bool tail, const void* activation,
++                              float* out, cudaStream_t stream) {
++    if (!enabled()) return false;
++    static std::once_flag logged[16];
++    int device = 0;
++    check(cudaGetDevice(&device), "IQ2_S J64 occupancy-2 device");
++    const DeviceFacts& facts = device_facts();
++    // Exact observed Coder expert tensor only. Other IQ2_S shapes retain the mature dispatcher.
++    constexpr int rows = 640, k = 2560;
++    constexpr std::int64_t row_bytes = 820; // 10 IQ2_S superblocks × 82 bytes
++    const char* prefill_8k_env = std::getenv("NINFER_QWEN4_PREFILL_8K");
++    const bool prefill_8k = prefill_8k_env != nullptr && prefill_8k_env[0] == '1' && prefill_8k_env[1] == '\0';
++    if (facts.cc != 1100 || table.rows != rows || table.k != k || table.row_bytes != row_bytes ||
++        max_active <= 0 || max_active > 256 || pairs <= 0 ||
++        (pairs > 65535 && (!prefill_8k || pairs > 81920)) ||
++        table.experts == nullptr || activation == nullptr || out == nullptr ||
++        routing.bounds == nullptr || routing.sorted == nullptr || routing.tile_count == nullptr ||
++        routing.tiles == nullptr || routing.tile_capacity <= 0) {
++        std::call_once(logged[device & 15], [] {
++            std::fprintf(stderr, "NInfer SM110 IQ2_S J64 occupancy-2: enabled but shape/device/routing guard rejected; using standard MMQ\n");
++        });
++        return false;
++    }
++
++    constexpr ggml_type type = GGML_TYPE_IQ2_S;
++    constexpr int J = 64;
++    const MatrixLaunch selected = select_moe_launch<type>(
++        rows, k, (pairs + max_active - 1) / max_active, tail);
++    // A/B probes may explicitly request the mature J64 route even when the selector picks J128.
++    if (selected.J != 128 && selected.J != J) return false;
++    const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, J, false, facts.cc);
++    if (config.type != type || config.I <= 0 || config.nthreads <= 0 || rows % config.I != 0) return false;
++    const bool steps = k % config.K_vram == 0 ||
++        (tail && config.K_vram == MMQ_ITER_K && k % ggml_cuda_type_traits<type>::qk == 0 && k % 32 == 0);
++    if (!steps) return false;
++    const std::size_t shared = mmq_get_nbytes_shared(config, facts.cc);
++    if (shared > facts.shared_per_block_optin) return false;
++    const std::int64_t listed64 = (std::int64_t(pairs) + J - 1) / J + max_active;
++    if (listed64 > routing.tile_capacity || listed64 > 65535) return false;
++
++    const RuntimeKernelInfo& runtime = runtime_kernel_info(device, config, shared);
++    if (runtime.active_blocks < 2) {
++        std::call_once(logged[device & 15], [&runtime] {
++            std::fprintf(stderr, "NInfer SM110 IQ2_S J64 occupancy-2: runtime allows %d CTA/SM; using standard MMQ\n", runtime.active_blocks);
++        });
++        return false;
++    }
++    std::call_once(logged[device & 15], [&runtime, shared, &config] {
++        std::fprintf(stderr, "NInfer SM110 IQ2_S J64 occupancy-2: active_cta_per_sm=%d threads=%d regs/thread=%d local_bytes/thread=%zu dynamic_shared=%zuB; enabled for rows=640 K=2560, route width J64\n",
++                     runtime.active_blocks, config.nthreads, runtime.registers, runtime.local_bytes, shared);
++    });
++
++    constexpr int width = 2; // matching route bin for J64; never consume J128/J32/J16 lists.
++    const dim3 grid(rows / config.I, static_cast<unsigned>(listed64), 1);
++    const dim3 block(WARP_SIZE, config.nthreads / WARP_SIZE, 1);
++    moe_mul_mat_q_iq2s_j64_occ2<<<grid, block, shared, stream>>>(
++        table.experts, static_cast<const int*>(activation), routing.sorted, routing.bounds,
++        routing.tiles + std::int64_t(width) * routing.tile_capacity,
++        routing.tile_count + width, out,
++        init_fastdiv_values(k / ggml_cuda_type_traits<type>::qk), rows,
++        static_cast<int>(table.row_bytes / ggml_cuda_type_traits<type>::bs), pairs);
++    check(cudaGetLastError(), "IQ2_S J64 occupancy-2 MMQ launch");
++    g_occ2_launch_count.fetch_add(1, std::memory_order_relaxed);
++    return true;
++}
++
++std::uint64_t sm110_iq2s_j64_occ2_launch_count_for_test() noexcept {
++    return g_occ2_launch_count.load(std::memory_order_relaxed);
++}
++
++} // namespace ninfer::ops::gguf::detail

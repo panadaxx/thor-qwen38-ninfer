@@ -1,0 +1,54 @@
+diff --git a/src/ops/softmax_attention/sources.cmake b/src/ops/softmax_attention/sources.cmake
+index 214960fb..9176cfa0 100644
+--- a/src/ops/softmax_attention/sources.cmake
++++ b/src/ops/softmax_attention/sources.cmake
+@@ -51,3 +51,35 @@ if(NINFER_ARCH_BLACKWELL)
+   target_sources(ninfer_ops PRIVATE
+     "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/prompt_nvfp4_fast.cu")
+ endif()
++
++# This SM110-only opt-in shortens compilation of the 28 dense small-T INT8 variants. These kernels
++# are not on Qwen3.8-Flash-Next's GDN/QSA sparse-attention path, but their implementations and
++# symbols stay present for explicit qualification and future models. The runtime path is unchanged.
++option(NINFER_THOR_FAST_BUILD_UNUSED_DENSE
++  "Use CUDA fast-compile flags for unused dense small-T INT8 kernels on SM110 compatibility builds" OFF)
++if(NINFER_THOR_FAST_BUILD_UNUSED_DENSE)
++  if(NOT NINFER_ARCH_SM110_COMPAT)
++    message(FATAL_ERROR
++      "NINFER_THOR_FAST_BUILD_UNUSED_DENSE is restricted to the SM110 compatibility build")
++  endif()
++
++  # Select only the explicit small_t_i8 translation units from this manifest; never remove them.
++  get_target_property(_ninfer_thor_ops_sources ninfer_ops SOURCES)
++  set(_ninfer_thor_small_t_i8_sources)
++  foreach(_source IN LISTS _ninfer_thor_ops_sources)
++    if(_source MATCHES "/softmax_attention/dense/causal_cache/small_t_i8_[^/]+\\.cu$")
++      list(APPEND _ninfer_thor_small_t_i8_sources "${_source}")
++    endif()
++  endforeach()
++  list(LENGTH _ninfer_thor_small_t_i8_sources _ninfer_thor_small_t_i8_count)
++  if(NOT _ninfer_thor_small_t_i8_count EQUAL 28)
++    message(FATAL_ERROR
++      "Expected exactly 28 dense small-T INT8 CUDA sources, found ${_ninfer_thor_small_t_i8_count}")
++  endif()
++
++  # CUDA 13's -Ofc=max prioritizes compiler throughput; -Xcompiler keeps host stubs at O1.
++  # This changes compilation effort only and is intentionally opt-in for qualification builds.
++  set_property(SOURCE ${_ninfer_thor_small_t_i8_sources} APPEND PROPERTY COMPILE_OPTIONS
++    -Ofc=max
++    -Xcompiler=-O1)
++endif()
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index f613fd88..9b980e20 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -44,7 +44,8 @@ if(NINFER_THOR_QUALIFICATION)
+     ninfer_moe_route_test
+     ninfer_sparse_moe_test
+     ninfer_gguf_flash_attention_test
+-    ninfer_sparse_attention_test)
++    ninfer_sparse_attention_test
++    ninfer_softmax_attention_test)
+   foreach(_program IN LISTS _ninfer_thor_qualification_programs)
+     if(NOT TARGET ${_program})
+       message(FATAL_ERROR "Thor qualification bundle requires existing program ${_program}")

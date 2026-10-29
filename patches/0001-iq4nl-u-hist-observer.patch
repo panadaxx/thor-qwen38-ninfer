@@ -1,0 +1,63 @@
+diff --git a/src/ops/linear/gguf/ggml_bridge.cu b/src/ops/linear/gguf/ggml_bridge.cu
+--- a/src/ops/linear/gguf/ggml_bridge.cu
++++ b/src/ops/linear/gguf/ggml_bridge.cu
+@@ -3,6 +3,9 @@
+ #include "ggml_bridge_internal.cuh"
+ #include "ggml_bridge_occ2.h"
+ #include "ggml_bridge_iq2s_occ2.h"
++#if defined(NINFER_THOR_IQ4NL_U_HIST)
++#include "iq4nl_down_u_hist.cuh"
++#endif
+ 
+ #include "ggml-cuda/dequantize.cuh"
+ 
+@@ -714,5 +717,26 @@ void moe_decode_down(GgmlType type, const MoeDecodeDownArgs& args, int chunk, cudaStream_t stream) {
+         throw std::invalid_argument("gguf moe decode: invalid down arguments");
+     }
++#if defined(NINFER_THOR_IQ4NL_U_HIST)
++    if (type == GgmlType::IQ4_NL && detail::iq4nl_down_u_hist_enabled()) {
++        const auto& facts = detail::device_facts();
++        if (facts.cc == 1100 && facts.sm_count == 14 && args.rows == 2560 &&
++            args.per_token == 10 && args.row_bytes == 360 && args.y == nullptr) {
++            int device = -1;
++            const cudaError_t device_status = cudaGetDevice(&device);
++            if (device_status == cudaSuccess) {
++                if (args.tokens == 1 && args.slots == 10) {
++                    detail::iq4nl_down_u_hist_initialize(args, device, stream);
++                } else if (chunk == 4 && args.tokens == 4 && args.slots == 40) {
++                    detail::iq4nl_down_u_hist_record(args, device, stream);
++                }
++            } else {
++                std::fprintf(stderr, "IQ4NL U histogram host hook cudaGetDevice failed: %s\n",
++                             cudaGetErrorString(device_status));
++                detail::iq4nl_down_u_hist_fail(cudaGetErrorString(device_status));
++            }
++        }
++    }
++#endif
+     detail::decode_launcher<detail::DecodeLaunch<MoeDecodeDownArgs>, detail::PickDown>(type)(
+         args, chunk, stream);
+ }
+diff --git a/src/ops/linear/gguf/sources.cmake b/src/ops/linear/gguf/sources.cmake
+--- a/src/ops/linear/gguf/sources.cmake
++++ b/src/ops/linear/gguf/sources.cmake
+@@ -81,2 +81,19 @@ target_sources(ninfer_ggml_quants PRIVATE "${CMAKE_CURRENT_LIST_DIR}/ggml_mmq_iq2s_occ2.cu")
+ 
+ target_sources(ninfer_ggml_quants PRIVATE "${CMAKE_CURRENT_LIST_DIR}/ggml_mmq_iq2s_occ2.cu")
++
++option(NINFER_ENABLE_THOR_IQ4NL_U_HIST "Compile opt-in IQ4_NL active-expert histogram observer" OFF)
++set(NINFER_THOR_IQ4NL_U_HIST_DIR "" CACHE PATH "Path to the isolated IQ4_NL U histogram observer")
++if(NINFER_ENABLE_THOR_IQ4NL_U_HIST)
++  if(NOT NINFER_ARCH_SM110_COMPAT)
++    message(FATAL_ERROR "IQ4NL U histogram observer is restricted to the SM110 compatibility build")
++  endif()
++  if(NOT IS_DIRECTORY "${NINFER_THOR_IQ4NL_U_HIST_DIR}/src" OR
++     NOT IS_DIRECTORY "${NINFER_THOR_IQ4NL_U_HIST_DIR}/include")
++    message(FATAL_ERROR "NINFER_THOR_IQ4NL_U_HIST_DIR must contain src/ and include/")
++  endif()
++  set(_ninfer_iq4nl_u_hist_source "${NINFER_THOR_IQ4NL_U_HIST_DIR}/src/iq4nl_down_u_hist.cu")
++  target_sources(ninfer_ggml_quants PRIVATE "${_ninfer_iq4nl_u_hist_source}")
++  target_include_directories(ninfer_ggml_quants PRIVATE "${NINFER_THOR_IQ4NL_U_HIST_DIR}/include")
++  set_property(SOURCE "${CMAKE_CURRENT_LIST_DIR}/ggml_bridge.cu"
++    APPEND PROPERTY COMPILE_DEFINITIONS NINFER_THOR_IQ4NL_U_HIST=1)
++endif()

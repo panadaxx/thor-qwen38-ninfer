@@ -1,0 +1,38 @@
+--- a/src/ops/sparse_attention/sparse_attention.cu
++++ b/src/ops/sparse_attention/sparse_attention.cu
+@@ -15,6 +15,9 @@
+ #include "ninfer/ops/kv_stream.h"
+ #if defined(NINFER_SM110A_COMPAT)
+ #include "thor_qsa_aot_wrapper.h"
++#if defined(NINFER_THOR_FLASHINFER_FA2_PREFIX)
++#include "thor_flashinfer_fa2_prefix.h"
++#endif
+ #endif
+ 
+ #include "core/device.h"
+@@ -547,8 +550,23 @@
+         const std::int32_t sparse_tokens = tokens - prefix;
+         if (sparse_tokens > kSplitTokens && (prefix == 0 || prefix > kSplitTokens)) {
+             if (prefix > 0) {
+-                launch<KvCacheStorage::BFloat16, 6>(q_p, first_p, select_p, counts_p, planes, table_p, scale, prefix,
+-                       nullptr, out_p, stream);
++                bool prefix_done = false;
++#if defined(NINFER_THOR_FLASHINFER_FA2_PREFIX)
++                if (!host_kv && cache.storage == KvCacheStorage::BFloat16 &&
++                    page_tokens == kPagedKVPageSize && host_first_position >= 0 &&
++                    prefix > kSplitTokens && prefix <= kThorQsaFirstSparsePosition) {
++                    const std::int32_t kv_len = host_first_position + prefix;
++                    const int fa2_status = ninfer_thor_flashinfer_fa2_prefix_try(
++                        q_p, cache.k_pages.data, cache.v_pages.data, table_p, kv_len, prefix,
++                        scale, &workspace, out_p, reinterpret_cast<void*>(stream));
++                    if (fa2_status < 0) throw std::runtime_error("FA2 prefix adapter failed; see diagnostic above");
++                    prefix_done = fa2_status > 0;
++                }
++#endif
++                if (!prefix_done) {
++                    launch<KvCacheStorage::BFloat16, 6>(q_p, first_p, select_p, counts_p, planes,
++                        table_p, scale, prefix, nullptr, out_p, stream);
++                }
+             }
+             const std::size_t row_offset = static_cast<std::size_t>(prefix) * kQueryHeads * kHeadDim;
+             const CUresult result = ninfer_thor_qsa_aot_launch(

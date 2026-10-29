@@ -1,0 +1,43 @@
+diff --git a/tests/ops/test_moe_experts_gguf.cpp b/tests/ops/test_moe_experts_gguf.cpp
+--- a/tests/ops/test_moe_experts_gguf.cpp
++++ b/tests/ops/test_moe_experts_gguf.cpp
+@@ -486,14 +486,39 @@ int main() {
+              Q::GGUF_IQ4_NL,
+              4,
+              {1, 2, 8},
+              kExperts},
++            // Coder's missing IQ2_S routed bank / custom Q2_0 down pair. Two distinct
++            // matrices are shared over the 256 valid Coder expert IDs to keep the fixture small;
++            // the original token-width sweep covers vector and matrix, resident and nonresident.
++            {"coder iq2_s/q2_0 down",
++             Q::GGUF_IQ2_S,
++             Q::GGUF_IQ2_S,
++             Q::GGUF_Q2_0,
++             Q::GGUF_IQ4_XS,
++             Q::GGUF_IQ4_XS,
++             Q::GGUF_IQ4_NL,
++             2,
++             {1, 2, 3, 8, 9, 16, 24, 40, 48},
++             256},
++            // Coder's other missing Q2_0 down pair, with the same bounded expert storage and
++            // complete original Q2_0 token-width sweep.
++            {"coder iq3_s/q2_0 down",
++             Q::GGUF_IQ3_S,
++             Q::GGUF_IQ3_S,
++             Q::GGUF_Q2_0,
++             Q::GGUF_IQ3_S,
++             Q::GGUF_IQ3_S,
++             Q::GGUF_Q2_0,
++             2,
++             {1, 2, 3, 8, 9, 16, 24, 40, 48},
++             256},
+             {"iq1_m/iq3_xxs",
+              Q::GGUF_IQ1_M,
+              Q::GGUF_IQ1_M,
+              Q::GGUF_Q2_0,
+              Q::GGUF_IQ3_XXS,
+              Q::GGUF_IQ3_XXS,
+              Q::GGUF_IQ4_NL,
+              4,
+              {1, 4, 16},
+              kExperts},

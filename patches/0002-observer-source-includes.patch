@@ -1,0 +1,12 @@
+--- a/src/ops/linear/gguf/sources.cmake
++++ b/src/ops/linear/gguf/sources.cmake
+@@ -95,7 +95,8 @@
+   endif()
+   set(_ninfer_iq4nl_u_hist_source "${NINFER_THOR_IQ4NL_U_HIST_DIR}/src/iq4nl_down_u_hist.cu")
+   target_sources(ninfer_ggml_quants PRIVATE "${_ninfer_iq4nl_u_hist_source}")
+-  target_include_directories(ninfer_ggml_quants PRIVATE "${NINFER_THOR_IQ4NL_U_HIST_DIR}/include")
++  set_property(SOURCE "${CMAKE_CURRENT_LIST_DIR}/ggml_bridge.cu" "${_ninfer_iq4nl_u_hist_source}"
++    APPEND PROPERTY INCLUDE_DIRECTORIES "${NINFER_THOR_IQ4NL_U_HIST_DIR}/include;${PROJECT_SOURCE_DIR}/src")
+   set_property(SOURCE "${CMAKE_CURRENT_LIST_DIR}/ggml_bridge.cu"
+     APPEND PROPERTY COMPILE_DEFINITIONS NINFER_THOR_IQ4NL_U_HIST=1)
+ endif()

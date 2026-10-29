@@ -1,0 +1,33 @@
+--- a/src/ops/sparse_attention/sparse_attention.cu
++++ b/src/ops/sparse_attention/sparse_attention.cu
+@@ -15,6 +15,9 @@
+ #include "ninfer/ops/kv_stream.h"
+ #if defined(NINFER_SM110A_COMPAT)
+ #include "thor_qsa_aot_wrapper.h"
++#if defined(NINFER_THOR_FLASHINFER_FA2_SPARSE)
++#include "thor_flashinfer_fa2_sparse.h"
++#endif
+ #if defined(NINFER_THOR_FLASHINFER_FA2_PREFIX)
+ #include "thor_flashinfer_fa2_prefix.h"
+ #endif
+@@ -569,6 +569,20 @@
+                 }
+             }
+             const std::size_t row_offset = static_cast<std::size_t>(prefix) * kQueryHeads * kHeadDim;
++#if defined(NINFER_THOR_FLASHINFER_FA2_SPARSE)
++            // Preserve the dense-prefix path above. Replace only this sparse suffix;
++            // on a qualified-request decline, continue through the existing QSA AOT route.
++            if (!host_kv && !streamed && cache.storage == KvCacheStorage::BFloat16 &&
++                page_tokens == kPagedKVPageSize && sparse_tokens > kSplitTokens) {
++                const int fa2_status = ninfer_thor_flashinfer_fa2_sparse_try(
++                    q_p + row_offset, cache.k_pages.data, cache.v_pages.data, table_p,
++                    select_p + static_cast<std::size_t>(prefix) * kTopBlocks, counts_p + prefix,
++                    host_first_position + prefix, sparse_tokens, scale, &workspace, out_p + row_offset,
++                    reinterpret_cast<void*>(stream));
++                if (fa2_status < 0) throw std::runtime_error("FA2 sparse adapter failed; see diagnostic above");
++                if (fa2_status > 0) return;
++            }
++#endif
+             const CUresult result = ninfer_thor_qsa_aot_launch(
+                 reinterpret_cast<CUstream>(stream),
+                 reinterpret_cast<CUdeviceptr>(q_p + row_offset),

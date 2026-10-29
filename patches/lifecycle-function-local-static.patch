@@ -1,0 +1,95 @@
+--- a/src/ops/thor-fa2-adapter/src/flashinfer_fa2_prefix.cu
++++ b/src/ops/thor-fa2-adapter/src/flashinfer_fa2_prefix.cu
+@@ -86,13 +86,60 @@
+     std::array<Slot, kMaxSlots> slots{};
+     bool initialized = false;
+     bool failed = false;
+-    ~Pool() {
++    int device = -1;
++
++    ~Pool() noexcept {
++        bool has_events = false;
++        for (const Slot& slot : slots) has_events |= slot.copied != nullptr;
++        if (!has_events && host == nullptr) return;
++
++        int previous = -1;
++        cudaError_t status = cudaGetDevice(&previous);
++        if (status != cudaSuccess) {
++            std::fprintf(stderr, "NInfer FA2 prefix pool cleanup cudaGetDevice failed: %s\n",
++                         cudaGetErrorString(status));
++        } else if (device >= 0 && previous != device) {
++            status = cudaSetDevice(device);
++            if (status != cudaSuccess) {
++                std::fprintf(stderr, "NInfer FA2 prefix pool cleanup cudaSetDevice(%d) failed: %s\n",
++                             device, cudaGetErrorString(status));
++            }
++        }
+         for (Slot& slot : slots) {
+-            if (slot.copied != nullptr) cudaEventDestroy(slot.copied);
++            if (slot.copied == nullptr) continue;
++            if (slot.in_flight) {
++                status = cudaEventSynchronize(slot.copied);
++                if (status != cudaSuccess) {
++                    std::fprintf(stderr, "NInfer FA2 prefix pool event synchronization failed: %s\n",
++                                 cudaGetErrorString(status));
++                }
++            }
++            status = cudaEventDestroy(slot.copied);
++            if (status != cudaSuccess) {
++                std::fprintf(stderr, "NInfer FA2 prefix pool event destruction failed: %s\n",
++                             cudaGetErrorString(status));
++            }
++            slot.copied = nullptr;
+         }
++        if (device >= 0 && previous >= 0 && previous != device) {
++            status = cudaSetDevice(previous);
++            if (status != cudaSuccess) {
++                std::fprintf(stderr, "NInfer FA2 prefix pool cleanup device restore failed: %s\n",
++                             cudaGetErrorString(status));
++            }
++        }
++        // `host` is destroyed immediately after this body. Its PinnedHostBuffer destructor
++        // reports cudaFreeHost failures, so all cleanup errors remain visible.
+     }
+ };
+-std::array<Pool, 16> g_pools{};
++
++std::array<Pool, 16>& pools() {
++    // Construct on first adapter use, after the caller has successfully queried CUDA device
++    // properties. Under reverse atexit registration order, its destructor should run before
++    // CUDA's process-exit handler, which the preceding runtime calls have already registered.
++    static std::array<Pool, 16> value{};
++    return value;
++}
+ std::atomic<uint64_t> g_launches{0};
+ std::atomic<int> g_event_error{int(cudaSuccess)};
+ 
+@@ -104,10 +151,13 @@
+ size_t align_up(size_t n, size_t a) { return (n + a - 1) & ~(a - 1); }
+ 
+ Slot* acquire_slot(int device) noexcept {
+-    if (device < 0 || device >= int(g_pools.size())) return nullptr;
+-    Pool& pool = g_pools[device];
++    auto& all_pools = pools();
++    if (device < 0 || device >= int(all_pools.size())) return nullptr;
++    Pool& pool = all_pools[device];
+     std::lock_guard<std::mutex> lock(pool.mutex);
+     if (pool.failed) return nullptr;
++    if (pool.device < 0) pool.device = device;
++    if (pool.device != device) return nullptr;
+     if (!pool.initialized) {
+         try {
+             pool.host = std::make_unique<ninfer::PinnedHostBuffer>(kPinnedBytes * kMaxSlots);
+@@ -154,8 +204,10 @@
+ }
+ 
+ cudaError_t release_slot(int device, Slot* slot, cudaStream_t stream, bool copy_queued) noexcept {
+-    if (slot == nullptr || device < 0 || device >= int(g_pools.size())) return cudaSuccess;
+-    Pool& pool = g_pools[device];
++    if (slot == nullptr || device < 0) return cudaSuccess;
++    auto& all_pools = pools();
++    if (device >= int(all_pools.size())) return cudaErrorInvalidDevice;
++    Pool& pool = all_pools[device];
+     std::lock_guard<std::mutex> lock(pool.mutex);
+     cudaError_t status = cudaSuccess;
+     if (copy_queued) {

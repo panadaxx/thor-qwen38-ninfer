@@ -1,0 +1,183 @@
+--- a/src/models/qwen4_exp/executor.cpp
++++ b/src/models/qwen4_exp/executor.cpp
+@@ -44,7 +44,12 @@
+ 
+ #include <algorithm>
+ #include <array>
++#include <atomic>
++#include <chrono>
+ #include <cmath>
++#include <exception>
++#include <cstdio>
++#include <cstdlib>
++#include <mutex>
+ #include <cstring>
+ #include <future>
+ #include <numeric>
+@@ -630,6 +635,13 @@
+     // While a draft chain is captured: its replays count no routes for the expert cache (the
+     // catch-up passes after a commit still do).
+     bool capturing_draft = false;
++    // Opt-in timing is created only for one-device execution; event sync is diagnostic only.
++    // Synchronization perturbs the request and is diagnostic, never a speed result.
++    bool mtp_phase_profile_enabled = false;
++    cudaEvent_t mtp_phase_start = nullptr, mtp_phase_stop = nullptr;
++    std::atomic<std::uint32_t> mtp_phase_log_lines{0};
++    std::atomic<std::uint64_t> mtp_phase_round{0};
++    std::mutex mtp_phase_mutex;
+     std::uint32_t pages          = 0; // KV pages per sequence and attention layer
+     PagedKVStorageLayout kv_layout;   // the planes of every sparse-attention layer's KV
+     std::uint32_t pooled_slots   = 0; // indexer blocks per sequence and attention layer
+@@ -837,9 +849,63 @@
+             memory.workspace_bytes += rank.workspace_bytes;
+             memory.expert_cache_bytes += rank.expert_cache_bytes;
+         }
++        const char* profile_env = std::getenv("NINFER_QWEN4_MTP_PHASE_PROFILE");
++        const bool requested = profile_env != nullptr && std::strcmp(profile_env, "1") == 0;
++        if (requested && options.draft_tokens > 0 && device.size() == 1) {
++            RankBinding bind(device, model.head_rank());
++            cudaError_t error = cudaEventCreate(&mtp_phase_start);
++            if (error != cudaSuccess) {
++                throw std::runtime_error(std::string("MTP profile start event: ") +
++                                         cudaGetErrorString(error));
++            }
++            error = cudaEventCreate(&mtp_phase_stop);
++            if (error != cudaSuccess) {
++                const cudaError_t cleanup_error = cudaEventDestroy(mtp_phase_start);
++                if (cleanup_error != cudaSuccess) {
++                    std::fprintf(stderr, "MTP profile cleanup failed for start event: %s\n",
++                                 cudaGetErrorString(cleanup_error));
++                }
++                mtp_phase_start = nullptr;
++                throw std::runtime_error(std::string("MTP profile stop event: ") +
++                                         cudaGetErrorString(error));
++            }
++            mtp_phase_profile_enabled = true;
++        } else if (requested && options.draft_tokens > 0 && device.size() != 1) {
++            std::fprintf(stderr,
++                         "{\"event\":\"qwen4_mtp_profile_disabled\","
++                         "\"reason\":\"requires_one_device\"}\n");
++        }
+     }
+ 
+     ~Impl() {
++        if (mtp_phase_start != nullptr || mtp_phase_stop != nullptr) {
++            const auto destroy_event = [](cudaEvent_t& event, const char* name) noexcept {
++                if (event == nullptr) { return; }
++                const cudaError_t error = cudaEventDestroy(event);
++                if (error != cudaSuccess) {
++                    std::fprintf(stderr, "MTP profile cleanup failed for %s: %s\n", name,
++                                 cudaGetErrorString(error));
++                }
++                event = nullptr;
++            };
++            try {
++                RankBinding bind(device, model.head_rank());
++                destroy_event(mtp_phase_stop, "stop event");
++                destroy_event(mtp_phase_start, "start event");
++            } catch (const std::exception& error) {
++                std::fprintf(stderr, "MTP profile cleanup could not bind rank: %s\n",
++                             error.what());
++            } catch (...) {
++                std::fprintf(stderr,
++                             "MTP profile cleanup could not bind rank: unknown exception\n");
++            }
++            mtp_phase_start = mtp_phase_stop = nullptr;
++        }
+         draft_prefetch.reset();
+         // The copier's queued copies finish before the events and buffers they use go.
+         for (auto& prefetch : prefetches) {
+@@ -3630,6 +3696,37 @@
+         }
+     }
+ 
++    void emit_mtp_phase(const char* phase, std::uint64_t round, std::size_t batch,
++                        std::uint32_t draft_steps, std::size_t draft_tokens,
++                        std::size_t verify_rows,
++                        std::chrono::steady_clock::time_point wall_start,
++                        cudaStream_t stream) {
++        CUDA_CHECK(cudaEventRecord(mtp_phase_stop, stream));
++        // This single phase-boundary wait is intentional and perturbs wall timing. No per-layer
++        // or per-kernel synchronization is added.
++        CUDA_CHECK(cudaEventSynchronize(mtp_phase_stop));
++        float gpu_ms = 0.0F;
++        CUDA_CHECK(cudaEventElapsedTime(&gpu_ms, mtp_phase_start, mtp_phase_stop));
++        const double wall_ms = std::chrono::duration<double, std::milli>(
++            std::chrono::steady_clock::now() - wall_start).count();
++        std::uint32_t line = mtp_phase_log_lines.load(std::memory_order_relaxed);
++        for (;;) {
++            if (line >= 512) { return; }
++            if (mtp_phase_log_lines.compare_exchange_weak(
++                    line, line + 1, std::memory_order_relaxed)) {
++                break;
++            }
++        }
++        std::fprintf(stderr,
++                     "{\"event\":\"qwen4_mtp_phase\",\"round\":%llu,"
++                     "\"phase\":\"%s\",\"batch\":%zu,\"draft_steps\":%u,"
++                     "\"draft_tokens\":%zu,\"verify_rows\":%zu,"
++                     "\"gpu_ms\":%.3f,\"wall_ms\":%.3f}\n",
++                     static_cast<unsigned long long>(round), phase, batch, draft_steps,
++                     draft_tokens, verify_rows, static_cast<double>(gpu_ms), wall_ms);
++        std::fflush(stderr);
++    }
++
+     // One MTP pass on the head rank over `n` cells whose starting stacks are in its input plane,
+     // their token ids at `ids` and positions at `positions` (device, head rank): the token's
+     // normalised embedding, projected, joins every stream of the normalised stack (one norm over
+@@ -3817,6 +3914,14 @@
+         }
+         RankBinding bind(device, model.head_rank());
+         RankState& rank = ranks[model.head_rank()];
++        const bool profile_phase = mtp_phase_profile_enabled;
++        std::unique_lock<std::mutex> profile_lock(mtp_phase_mutex, std::defer_lock);
++        if (profile_phase) { profile_lock.lock(); }
++        const auto profile_wall_start = profile_phase ? std::chrono::steady_clock::now()
++                                                     : std::chrono::steady_clock::time_point{};
++        const std::uint64_t profile_round = profile_phase
++            ? mtp_phase_round.fetch_add(1, std::memory_order_relaxed) + 1 : 0;
++        if (profile_phase) { CUDA_CHECK(cudaEventRecord(mtp_phase_start, rank.stream)); }
+         // Step i's cell of a sequence sits at its position - 1 + i and pairs the stack before it
+         // (the kept one at step 0) with the step's token (the anchor at step 0).
+         std::vector<std::int32_t> positions(k * b);
+@@ -3947,6 +4052,10 @@
+             }
+             if (!extents.empty()) { extents[j] = lengths[j]; }
+         }
++        if (profile_phase) {
++            emit_mtp_phase("draft", profile_round, b, static_cast<std::uint32_t>(ran),
++                           ran * b, 0, profile_wall_start, rank.stream);
++        }
+         return static_cast<std::uint32_t>(ran);
+     }
+ 
+@@ -3974,6 +4083,17 @@
+             sequence->verify_tokens.assign(tokens.begin() + std::ptrdiff_t(j * w),
+                                            tokens.begin() + std::ptrdiff_t((j + 1) * w));
+             verified.push_back(sequence);
++        }
++        const bool profile_phase = mtp_phase_profile_enabled;
++        std::unique_lock<std::mutex> profile_lock(mtp_phase_mutex, std::defer_lock);
++        if (profile_phase) { profile_lock.lock(); }
++        const auto profile_wall_start = profile_phase ? std::chrono::steady_clock::now()
++                                                     : std::chrono::steady_clock::time_point{};
++        const std::uint64_t profile_round = profile_phase
++            ? mtp_phase_round.load(std::memory_order_relaxed) : 0;
++        if (profile_phase) {
++            RankBinding bind(device, model.head_rank());
++            CUDA_CHECK(cudaEventRecord(mtp_phase_start, ranks[model.head_rank()].stream));
+         }
+         verifying = true;
+         try {
+@@ -4000,6 +4120,11 @@
+             throw;
+         }
+         verifying = false;
++        if (profile_phase) {
++            RankBinding bind(device, model.head_rank());
++            emit_mtp_phase("verify", profile_round, b, 0, 0, tokens.size(),
++                           profile_wall_start, ranks[model.head_rank()].stream);
++        }
+     }
+ 
+     void commit(std::span<const std::uint32_t> batch, std::span<const std::uint32_t> kept) {

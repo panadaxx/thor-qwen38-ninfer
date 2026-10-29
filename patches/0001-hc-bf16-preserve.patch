@@ -1,0 +1,108 @@
+--- a/tools/convert/qwen4_exp_gguf.py
++++ b/tools/convert/qwen4_exp_gguf.py
+@@ -2,10 +2,10 @@
+ 
+ The GSQ-RCO releases store every matrix in the type its allocation chose, one ggml type per tensor,
+ so no weight is re-quantised: a row of the artifact is byte for byte a row of the GGUF, and the
+-expert banks keep the exporter's expert-major layout. The hyper-connection matrices, BF16 in the
+-release, become ggml Q8_0 rows, the one re-quantised form, which their kernels read; the other BF16
+-matrices (router, indexer, the GDN gates) stay BF16; F32/F16 vectors become the artifact's direct
+-formats.
++expert banks keep the exporter's expert-major layout. BF16 hyper-connection matrices stay BF16;
++source Q8_0 matrices stay Q8_0, and other block types are decoded and rounded to Q8_0 for the
++hyper-connection kernels. Other BF16 matrices (router, indexer, the GDN gates) stay BF16;
++F32/F16 vectors become the artifact's direct formats.
+ 
+ llama.cpp's exporter conventions are undone where they touch rows or small tensors: Gated DeltaNet
+ value heads return to the grouped order (``ssm_out`` keeps its tiled input columns, which a row copy
+@@ -401,14 +401,20 @@
+     return _bf16_rows(gguf, tensor, shape, rows()), False
+ 
+ 
+-def hc_matrix_source(gguf: GGUFFile, tensor: str, shape: tuple[int, int]) -> LogicalSource:
+-    """A hyper-connection matrix as ggml Q8_0 rows, which its kernels read: the stored blocks when
+-    the GGUF keeps Q8_0, otherwise its values (BF16 words exactly, other blocks decoded) quantized by
+-    ggml's quantize_row_q8_0_ref."""
++def hc_matrix_source(
++    gguf: GGUFFile, tensor: str, shape: tuple[int, int]
++) -> tuple[LogicalSource, bool]:
++    """Return the source and whether it is already encoded in an artifact format.
++
++    BF16 HC weights use the runtime's native BF16 path and are copied without another quantization.
++    Stored Q8_0 rows remain byte-exact; other block formats use the existing Q8_0 conversion.
++    """
+ 
+     info = gguf.info(tensor)
+     if info.type_id == GGML_Q8_0:
+-        return block_source(gguf, tensor, shape, rows())
++        return block_source(gguf, tensor, shape, rows()), True
++    if info.type_id == TYPE_BF16:
++        return _bf16_rows(gguf, tensor, shape, rows()), False
+     stored = (block_source(gguf, tensor, shape, rows()) if info.type_id in GGUF_FORMATS_BY_TYPE
+               else _bf16_rows(gguf, tensor, shape, rows()))
+     columns = shape[1]
+@@ -422,8 +428,11 @@
+     def values(first: int, last: int) -> torch.Tensor:
+         return torch.from_numpy(dequantize_q8_0(encoded(first, last).codes.numpy()))
+ 
+-    return LogicalSource(
+-        shape, f"{tensor}[{info.type_name} as Q8_0]{list(shape)}", _flat(values, columns), encoded
++    return (
++        LogicalSource(
++            shape, f"{tensor}[{info.type_name} as Q8_0]{list(shape)}", _flat(values, columns), encoded
++        ),
++        True,
+     )
+ 
+ 
+@@ -468,7 +477,7 @@
+ 
+ def mtp_sources(gguf: GGUFFile, experts: int) -> dict[str, tuple[LogicalSource, bool]]:
+     """Every parameter of the `mtp` component from an MTP GGUF; True marks encoded block rows.
+-    Every norm drops its stored `1 + w`; the hyper-connection matrices are Q8_0 rows."""
++    Every norm drops its stored `1 + w`; hyper-connection blocks keep their supported formats."""
+ 
+     out: dict[str, tuple[LogicalSource, bool]] = {}
+     g = f"blk.{MTP_BLOCK}."
+@@ -482,11 +491,11 @@
+ 
+     def hc(prefix: str, stored: str, inject: bool):
+         direct(prefix + "norm", _norm(gguf, stored + "norm.weight", True))
+-        out[prefix + "down"] = hc_matrix_source(gguf, stored + "down.weight", (LOWRANK, WIDTH)), True
+-        out[prefix + "up"] = hc_matrix_source(gguf, stored + "up.weight", (WIDTH, LOWRANK)), True
++        out[prefix + "down"] = hc_matrix_source(gguf, stored + "down.weight", (LOWRANK, WIDTH))
++        out[prefix + "up"] = hc_matrix_source(gguf, stored + "up.weight", (WIDTH, LOWRANK))
+         if inject:
+-            out[prefix + "inject"] = (
+-                hc_matrix_source(gguf, stored + "inject.weight", (STREAMS, WIDTH)), True
++            out[prefix + "inject"] = hc_matrix_source(
++                gguf, stored + "inject.weight", (STREAMS, WIDTH)
+             )
+ 
+     direct("mtp/embedding_norm", _norm(gguf, n + "enorm.weight", True))
+@@ -551,11 +560,11 @@
+ 
+     def hc(prefix: str, stored: str, inject: bool):
+         direct(prefix + "norm", _norm(gguf, stored + "norm.weight", True))
+-        out[prefix + "down"] = hc_matrix_source(gguf, stored + "down.weight", (LOWRANK, WIDTH)), True
+-        out[prefix + "up"] = hc_matrix_source(gguf, stored + "up.weight", (WIDTH, LOWRANK)), True
++        out[prefix + "down"] = hc_matrix_source(gguf, stored + "down.weight", (LOWRANK, WIDTH))
++        out[prefix + "up"] = hc_matrix_source(gguf, stored + "up.weight", (WIDTH, LOWRANK))
+         if inject:
+-            out[prefix + "inject"] = (
+-                hc_matrix_source(gguf, stored + "inject.weight", (STREAMS, WIDTH)), True
++            out[prefix + "inject"] = hc_matrix_source(
++                gguf, stored + "inject.weight", (STREAMS, WIDTH)
+             )
+ 
+     matrix("text/token_embedding", "token_embd.weight", (VOCABULARY, HIDDEN))
+@@ -681,7 +690,8 @@
+     table it reads even when the table's rows go into an artifact of their own. The Vision tower
+     comes from the release's BF16 `mmproj` GGUF (`--source vision=mmproj.gguf`) and stays BF16; the
+     MTP block from an MTP GGUF (`--source mtp=mtp-*.gguf`), whose matrices keep their blocks. Every
+-    hyper-connection matrix is stored as ggml Q8_0 rows (hc_matrix_source)."""
++    BF16 hyper-connection matrices stay BF16; stored Q8_0 and decoded other blocks follow
++    hc_matrix_source's supported-format policy."""
+ 
+     from .qwen4_exp_ngram import configure_ngram
+ 

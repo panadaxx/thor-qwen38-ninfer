@@ -1,0 +1,420 @@
+--- a/src/models/qwen4_exp/model.h
++++ b/src/models/qwen4_exp/model.h
+@@ -128,6 +128,12 @@
+     [[nodiscard]] std::size_t head_rank() const noexcept { return stages_.stages() - 1; }
+ 
+     [[nodiscard]] const BoundWeight& weight(WeightId id) const { return bound_.at(id.index); }
++
++    // Optional, model-owned T=1 Q6_K sidecars. The raw artifact-backed view remains canonical.
++    [[nodiscard]] const DeviceBuffer* padded_q6k_t1(WeightId id) const noexcept {
++        const auto it = padded_q6k_t1_.find(id.index);
++        return it == padded_q6k_t1_.end() ? nullptr : &it->second;
++    }
+ 
+     [[nodiscard]] std::span<const BoundWeight> weight_data() const noexcept { return bound_; }
+ 
+@@ -189,6 +195,8 @@
+     std::optional<qwen3_5::VisionWeights> vision_weights_;
+     std::optional<MtpConfig> mtp_config_;
+     std::optional<MtpWeights> mtp_weights_;
++    // Declared last so its CUDA allocations are released before all borrowed model storage.
++    std::map<std::size_t, DeviceBuffer> padded_q6k_t1_;
+ };
+ 
+ // Whether the artifact's text component is this family.
+--- a/src/models/qwen4_exp/model.cpp
++++ b/src/models/qwen4_exp/model.cpp
+@@ -5,10 +5,16 @@
+ #include "artifact/views.h"
+ #include "models/qwen3_5/frontend/tokenizer.h"
+ #include "models/qwen3_5/load/bindings.h"
++#include "ops/linear/gguf/q6k_cooperative.h"
+ 
+ #include <algorithm>
++#include <cstdio>
++#include <cstdlib>
++#include <fstream>
++#include <limits>
+ #include <numeric>
+ #include <set>
++#include <sstream>
+ #include <stdexcept>
+ #include <string>
+ #include <utility>
+@@ -496,6 +502,114 @@
+     model->vision_weights_ = std::move(vision_weights);
+     model->mtp_config_     = std::move(mtp_config);
+     model->mtp_weights_    = std::move(mtp_weights);
++
++    // Experimental Thor-only T=1 sidecars. The original GGUF storage is never rewritten and
++    // remains the source of truth for every prefill/batched projection.
++    const char* padded_flag = std::getenv("NINFER_THOR_Q6K_PADDED_T1");
++    if (padded_flag != nullptr && std::string_view(padded_flag) == "1") {
++        if (device.size() != 1 || device.rank(0).compute_capability() != 110 ||
++            device.rank(0).multiprocessor_count() != 14) {
++            throw std::runtime_error(
++                "NINFER_THOR_Q6K_PADDED_T1 requires one SM110/14-SM device");
++        }
++        struct Candidate {
++            std::size_t id;
++            const std::byte* raw;
++            std::int64_t blocks;
++            std::size_t padded_bytes;
++        };
++        std::vector<Candidate> candidates;
++        std::size_t total_bytes = 0;
++        for (std::size_t id = 0; id < model->bound_.size(); ++id) {
++            const BoundWeight& bound_weight = model->bound_[id];
++            const auto& view = bound_weight.view;
++            if (bound_weight.rank != 0 || bound_weight.name.find("/moe/") != std::string::npos ||
++                view.parts.size() != 1 || view.shape.size() != 2) {
++                continue;
++            }
++            const auto& region = view.parts.front();
++            if (region.parent == nullptr || region.begin != 0 ||
++                region.end != region.parent->geometry.elements ||
++                region.parent->geometry.format != QType::GGUF_Q6_K ||
++                region.parent->geometry.layout != QuantLayout::GgufBlocks ||
++                region.parent->data == nullptr) {
++                continue;
++            }
++            const auto rows = view.shape[0];
++            const auto k = view.shape[1];
++            const bool shape = (rows == 6144 && k == 2560) || (rows == 10240 && k == 2560) ||
++                               (rows == 2560 && k == 6144) || (rows == 2560 && k == 10240);
++            if (!shape || k % 256 != 0 ||
++                rows > std::size_t(std::numeric_limits<std::int32_t>::max())) { continue; }
++            const std::uint64_t blocks = rows * (k / 256);
++            if (blocks > std::uint64_t(std::numeric_limits<std::int64_t>::max()) ||
++                blocks * 210 != region.parent->geometry.bytes ||
++                blocks > (std::numeric_limits<std::size_t>::max() / 212)) {
++                continue;
++            }
++            const std::size_t bytes = static_cast<std::size_t>(blocks * 212);
++            if (bytes > std::numeric_limits<std::size_t>::max() - total_bytes) {
++                throw std::overflow_error("NINFER_THOR_Q6K_PADDED_T1 byte count overflow");
++            }
++            candidates.push_back({id, region.parent->data, static_cast<std::int64_t>(blocks), bytes});
++            total_bytes += bytes;
++        }
++        if (candidates.empty()) {
++            throw std::runtime_error("NINFER_THOR_Q6K_PADDED_T1 found no fully-bound eligible weights");
++        }
++        const auto read_memavailable = [] {
++            std::uint64_t available = 0;
++            std::ifstream meminfo("/proc/meminfo");
++            std::string line;
++            while (std::getline(meminfo, line)) {
++                if (line.rfind("MemAvailable:", 0) == 0) {
++                    std::istringstream value(line.substr(13));
++                    std::uint64_t kib = 0;
++                    value >> kib;
++                    available = kib * 1024;
++                    break;
++                }
++            }
++            return available;
++        };
++        const std::uint64_t host_available_before = read_memavailable();
++        if (host_available_before < (std::uint64_t{2} << 30)) {
++            throw std::runtime_error("NINFER_THOR_Q6K_PADDED_T1 needs at least 2 GiB MemAvailable");
++        }
++        {
++            RankBinding bind(device, 0);
++            if (!q6k_cooperative::q6k_cooperative_available()) {
++                throw std::runtime_error("NINFER_THOR_Q6K_PADDED_T1 CUDA dispatch unavailable");
++            }
++            std::size_t free_before = 0, total_device = 0;
++            CUDA_CHECK(cudaMemGetInfo(&free_before, &total_device));
++            constexpr std::size_t kGpuReserve = std::size_t{4} << 30;
++            if (total_bytes > free_before || free_before - total_bytes < kGpuReserve) {
++                throw std::runtime_error("NINFER_THOR_Q6K_PADDED_T1 sidecars fail 4 GiB GPU reserve preflight");
++            }
++            q6k_cooperative::q6k_padded_t1_prepare();
++            const cudaStream_t stream = device.transfer_stream_for_rank(0);
++            for (const Candidate& candidate : candidates) {
++                DeviceBuffer padded(candidate.padded_bytes);
++                q6k_cooperative::q6k_repack_padded(candidate.raw, padded.p,
++                                                    candidate.blocks, stream);
++                model->padded_q6k_t1_.emplace(candidate.id, std::move(padded));
++            }
++            std::size_t free_after = 0;
++            CUDA_CHECK(cudaMemGetInfo(&free_after, &total_device));
++            const std::uint64_t host_available_after = read_memavailable();
++            if (host_available_after < (std::uint64_t{2} << 30)) {
++                throw std::runtime_error(
++                    "NINFER_THOR_Q6K_PADDED_T1 left less than 2 GiB MemAvailable");
++            }
++            std::fprintf(stderr,
++                         "Q6K padded T1 opt-in: weights=%zu bytes=%zu GPU_free_before=%zu "
++                         "GPU_free_after=%zu MemAvailable_before=%llu MemAvailable_after=%llu\n",
++                         model->padded_q6k_t1_.size(), total_bytes, free_before, free_after,
++                         static_cast<unsigned long long>(host_available_before),
++                         static_cast<unsigned long long>(host_available_after));
++        }
++    }
+     return model;
+ }
+ 
+--- a/src/models/qwen4_exp/executor.cpp
++++ b/src/models/qwen4_exp/executor.cpp
+@@ -43,6 +43,7 @@
+ #include "ninfer/ops/sigmoid_mul.h"
+ #include "ninfer/ops/sparse_attention.h"
+ #include "ninfer/ops/weight_input.h"
++#include "ops/linear/gguf/gguf_linear.h"
+ 
+ #include <algorithm>
+ #include <array>
+@@ -83,6 +84,7 @@
+         ops::SingleProjectionWeight weight;
+         std::int32_t row  = 0;
+         std::int32_t rows = 0;
++        const void* padded_q6k_t1 = nullptr;
+     };
+ 
+     std::vector<Piece> pieces;
+@@ -116,7 +118,13 @@
+ Projection make_projection(const Model& model, std::initializer_list<WeightId> ids) {
+     std::vector<ops::WeightInput> inputs;
+     for (const WeightId id : ids) { inputs.push_back(model.input(id)); }
+-    return make_projection(inputs);
++    Projection out = make_projection(inputs);
++    if (ids.size() == 1 && out.pieces.size() == 1) {
++        if (const DeviceBuffer* buffer = model.padded_q6k_t1(*ids.begin())) {
++            out.pieces.front().padded_q6k_t1 = buffer->p;
++        }
++    }
++    return out;
+ }
+ 
+ std::size_t projection_workspace(const Projection& p, std::int32_t tokens) {
+@@ -135,7 +143,13 @@
+              cudaStream_t stream) {
+     const std::int32_t tokens = x.ne[1];
+     if (p.pieces.size() == 1) {
+-        ops::linear(x, p.pieces.front().weight.weight, out, p.pieces.front().weight.policy,
++        const auto& piece = p.pieces.front();
++        if (tokens == 1 && piece.padded_q6k_t1 != nullptr) {
++            ops::detail::gguf_linear_q6k_padded_t1(x, piece.weight.weight,
++                                                    piece.padded_q6k_t1, out, workspace, stream);
++            return;
++        }
++        ops::linear(x, piece.weight.weight, out, piece.weight.policy,
+                     workspace, stream);
+         return;
+     }
+--- a/src/ops/linear/gguf/q6k_cooperative.h
++++ b/src/ops/linear/gguf/q6k_cooperative.h
+@@ -5,6 +5,14 @@
+ bool q6k_cooperative_available();
+ // Run during workspace planning before graph capture to cache cooperative T/K occupancy variants.
+ void q6k_cooperative_prepare();
++// Warm the exact T=1 aligned-layout specializations before any CUDA Graph capture.
++void q6k_padded_t1_prepare();
++// Repack complete Q6_K blocks from 210-byte to 212-byte block stride; caller owns both buffers.
++void q6k_repack_padded(const void* raw, void* padded, std::int64_t blocks, cudaStream_t stream);
++// Same T=1 arithmetic over the private 212-byte row layout.
++void q6k_padded_t1_product(const void* weight, std::int64_t row_bytes, int rows, int k,
++                           const void* q8_activation,
++                           const ninfer::ops::gguf::VectorOutput& out, cudaStream_t stream);
+ void q6k_cooperative_product(const void* weight, std::int64_t row_bytes, int rows, int k,
+                              const void* q8_activation, int columns,
+                              const ninfer::ops::gguf::VectorOutput& out, cudaStream_t stream);
+--- a/src/ops/linear/gguf/q6k_cooperative.cu
++++ b/src/ops/linear/gguf/q6k_cooperative.cu
+@@ -171,6 +171,104 @@
+     }
+ }
+ 
++// Same Q6_K arithmetic/scale grouping as q6k_cooperative::upstream::Q6Decoder. The only storage
++// changes are a 212-byte padded block stride and aligned u32_a4 loads for ql/qh words.
++struct Q6AlignedDecoder {
++    static constexpr int kBlockBytes = 212;
++
++    __device__ __forceinline__ static void decode(const std::uint8_t* b, int u, vec::Slice& s) {
++        const int h = u / 4, q = u % 4;
++        const float d = vec::half_at(b + 208);
++        const auto* sc = reinterpret_cast<const std::int8_t*>(b + 192 + 8 * h);
++        s.f[0] = d * float(sc[2 * q]);
++        s.f[1] = d * float(sc[2 * q + 1]);
++        const std::uint8_t* ql = b + 64 * h + 32 * (q & 1);
++        const std::uint8_t* qh = b + 128 + 32 * h;
++        const unsigned mask = 0xFu << (threadIdx.x & 28);
++#pragma unroll
++        for (int base = 0; base < 8; base += 4) {
++            const std::uint32_t hi = vec::u32_a4(qh + 4 * (base + q));
++            const std::uint32_t lo0 = vec::u32_a4(ql + 4 * (base + (q >> 1)));
++            const std::uint32_t lo1 = vec::u32_a4(ql + 4 * (base + 2 + (q >> 1)));
++#pragma unroll
++            for (int j = 0; j < 4; ++j) {
++                const std::uint32_t high = __shfl_sync(mask, hi, j, 4);
++                const std::uint32_t low = __shfl_sync(mask, j < 2 ? lo0 : lo1,
++                                                       (q & 1) + 2 * (j & 1), 4);
++                const std::uint32_t v = ((low >> (4 * (q >> 1))) & 0x0F0F0F0Fu) |
++                                        (((high >> (2 * q)) << 4) & 0x30303030u);
++                s.w[base + j] = int(v ^ 0xE0E0E0E0u ^ ((v & 0x20202020u) * 6u));
++            }
++        }
++    }
++
++    __device__ __forceinline__ static float dot(const vec::Slice& s, const int* a, float d) {
++        return __fmul_rn(d, __fadd_rn(__fmul_rn(s.f[0], float(vec::dot4(s.w, a, 0))),
++                                      __fmul_rn(s.f[1], float(vec::dot4(s.w + 4, a + 4, 0)))));
++    }
++};
++
++inline constexpr int kWarps = detail::kVecWarps;
++
++__launch_bounds__(kWarps * 32) __global__ void q6_aligned_t1_kernel(detail::VecArgs p, int k) {
++    constexpr int kRowsPerLaneGroup = 2;
++    const int lane = int(threadIdx.x) & 31;
++    const int warp = int(threadIdx.x) >> 5;
++    const int slices = k / 32;
++    const int block_in_row = lane / 8;
++    const std::int64_t row_offset = std::int64_t(block_in_row) * Q6AlignedDecoder::kBlockBytes;
++    for (int row0 = (int(blockIdx.x) * kWarps + warp) * kRowsPerLaneGroup;
++         row0 < p.rows; row0 += int(gridDim.x) * kWarps * kRowsPerLaneGroup) {
++        const std::uint8_t* rowp[2] = {
++            p.weight + std::int64_t(row0) * p.row_bytes + row_offset,
++            p.weight + std::int64_t(min(row0 + 1, p.rows - 1)) * p.row_bytes + row_offset};
++        float acc[2] = {0.0f, 0.0f};
++        for (int it = 0; lane + 32 * it < slices; ++it) {
++            const int s = lane + 32 * it;
++            const auto* activation = reinterpret_cast<const int4*>(p.qs + 32 * s);
++            const int4 a0 = activation[0], a1 = activation[1];
++            const int a[8] = {a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w};
++            const float d = __half22float2(p.ds[s]).x;
++#pragma unroll
++            for (int r = 0; r < 2; ++r) {
++                vec::Slice decoded;
++                const std::uint8_t* block = rowp[r] + std::int64_t(4 * it) * Q6AlignedDecoder::kBlockBytes;
++                Q6AlignedDecoder::decode(block, s & 7, decoded);
++                acc[r] += Q6AlignedDecoder::dot(decoded, a, d);
++            }
++        }
++#pragma unroll
++        for (int r = 0; r < 2; ++r) {
++#pragma unroll
++            for (int offset = 16; offset > 0; offset >>= 1) {
++                acc[r] += __shfl_xor_sync(0xFFFFFFFFu, acc[r], offset);
++            }
++        }
++        if (lane == 0) {
++            if (row0 < p.rows) { detail::vec_store(p.out, row0, 0, acc[0]); }
++            if (row0 + 1 < p.rows) { detail::vec_store(p.out, row0 + 1, 0, acc[1]); }
++        }
++    }
++}
++
++
++__global__ void repack_q6k_blocks(const std::uint8_t* raw, std::uint8_t* padded, std::int64_t blocks) {
++    const std::int64_t i = std::int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
++    if (i >= blocks) return;
++    for (int j=0;j<210;++j) padded[i*212+j]=raw[i*210+j];
++    padded[i*212+210]=0; padded[i*212+211]=0;
++}
++
++int padded_resident_blocks() {
++    static const int active=[] {
++        int n=0;
++        detail::check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&n,q6_aligned_t1_kernel,
++                      kWarps*32,0), "padded Q6 occupancy");
++        return n;
++    }();
++    return active;
++}
++
+ detail::VecArgs make_args(const void* weight, std::int64_t row_bytes, int rows, int k,
+                           const void* activation, int columns, const detail::VecStore& out) {
+     if (!weight || !activation || rows <= 0 || columns < 1 || columns > gguf::kMaxVectorColumns ||
+@@ -213,4 +311,43 @@
+                                 columns, stream);
+ }
+ 
++
++void q6k_padded_t1_prepare() {
++    (void)padded_resident_blocks();
++    (void)detail::device_facts();
++}
++void q6k_repack_padded(const void* raw, void* padded, std::int64_t blocks, cudaStream_t stream) {
++    if (!raw || !padded || blocks <= 0) throw std::invalid_argument("padded Q6 repack buffers");
++    repack_q6k_blocks<<<static_cast<int>((blocks+255)/256),256,0,stream>>>(
++        static_cast<const std::uint8_t*>(raw),static_cast<std::uint8_t*>(padded),blocks);
++    detail::check(cudaGetLastError(), "padded Q6 repack launch");
++    detail::check(cudaStreamSynchronize(stream), "padded Q6 repack completion");
++}
++
++void q6k_padded_t1_product(const void* weight, std::int64_t row_bytes, int rows, int k,
++             const void* activation, const ninfer::ops::gguf::VectorOutput& out,
++             cudaStream_t stream) {
++    if (weight == nullptr || activation == nullptr || rows <= 0 ||
++        (k != 2560 && k != 6144 && k != 10240) ||
++        row_bytes != std::int64_t(k / 256) * Q6AlignedDecoder::kBlockBytes ||
++        (out.bf16 == nullptr) == (out.f32 == nullptr)) {
++        throw std::invalid_argument("Q6 aligned probe: unsupported shape or output");
++    }
++    const auto* q8 = static_cast<const std::uint8_t*>(activation);
++    const detail::VecStore store{out.bf16, out.f32, out.column_stride, out.epilogue,
++                                 out.gate, out.gate_column_stride, static_cast<int>(out.activation)};
++    detail::VecArgs args{static_cast<const std::uint8_t*>(weight), row_bytes, rows, k,
++        reinterpret_cast<const std::int8_t*>(q8),
++        reinterpret_cast<const half2*>(q8 + ninfer::ops::gguf::vector_activation_scales_offset(k, 1)), store};
++    const int active=padded_resident_blocks();
++    const int sms=detail::device_facts().sm_count;
++    const int groups = (rows + 2 * kWarps - 1) / (2 * kWarps);
++    const int blocks = std::min(groups, std::max(active, 1) * std::max(sms, 1));
++    q6_aligned_t1_kernel<<<blocks, kWarps * 32, 0, stream>>>(args, k);
++    const cudaError_t launch_status = cudaGetLastError();
++    if (launch_status != cudaSuccess) {
++        throw std::runtime_error(std::string("Q6 aligned launch: ") + cudaGetErrorString(launch_status));
++    }
++}
++
+ } // namespace ninfer::q6k_cooperative
+--- a/src/ops/linear/gguf/gguf_linear.h
++++ b/src/ops/linear/gguf/gguf_linear.h
+@@ -63,6 +63,10 @@
+ 
+ void gguf_linear(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& workspace,
+                  cudaStream_t stream);
++// Private model-owned 212-byte/block T=1 cache route. The raw Weight remains canonical and is
++// still used by all batched/prefill paths.
++void gguf_linear_q6k_padded_t1(const Tensor& x, const Weight& w, const void* padded,
++                               Tensor& out, WorkspaceArena& workspace, cudaStream_t stream);
+ void gguf_linear_add(const Tensor& x, const Weight& w, Tensor& residual,
+                      WorkspaceArena& workspace, cudaStream_t stream);
+ 
+--- a/src/ops/linear/gguf/gguf_linear.cpp
++++ b/src/ops/linear/gguf/gguf_linear.cpp
+@@ -580,6 +580,30 @@
+     gguf_project(x, {&product, 1}, workspace, stream);
+ }
+ 
++void gguf_linear_q6k_padded_t1(const Tensor& x, const Weight& w, const void* padded,
++                               Tensor& out, WorkspaceArena& workspace, cudaStream_t stream) {
++    require_activation(x, "padded Q6_K T1");
++    if (x.ne[1] != 1 || w.qtype != QType::GGUF_Q6_K || !padded ||
++        !out.is_contiguous() || out.dtype != DType::BF16 || out.ne[0] != w.n || out.ne[1] != 1 ||
++        !((w.n == 6144 && w.k == 2560) || (w.n == 10240 && w.k == 2560) ||
++          (w.n == 2560 && w.k == 6144) || (w.n == 2560 && w.k == 10240))) {
++        throw std::invalid_argument("padded Q6_K T1: unsupported input, weight, or output: T=" +
++            std::to_string(x.ne[1]) + " type=" + std::to_string(static_cast<int>(w.qtype)) +
++            " out_contiguous=" + std::to_string(out.is_contiguous()) +
++            " out_dtype=" + std::to_string(static_cast<int>(out.dtype)) +
++            " out_n=" + std::to_string(out.ne[0]) + " out_t=" + std::to_string(out.ne[1]) +
++            " weight_n=" + std::to_string(w.n) + " weight_k=" + std::to_string(w.k) +
++            " input_columns=" + std::to_string(w.input_columns != nullptr));
++    }
++    auto scope = workspace.scope();
++    void* activation = workspace.alloc_bytes(gguf::vector_activation_bytes(w.k, 1)).data;
++    gguf::quantize_vector_activation(static_cast<const __nv_bfloat16*>(x.data), w.k, 1,
++                                     w.input_columns, activation, stream);
++    GgufProduct product{&w, &out, 0, GgufEpilogue::Store};
++    q6k_cooperative::q6k_padded_t1_product(
++        padded, std::int64_t(w.k / 256) * 212, w.n, w.k, activation, output(product, 0), stream);
++}
++
+ void gguf_linear_add(const Tensor& x, const Weight& w, Tensor& residual,
+                      WorkspaceArena& workspace, cudaStream_t stream) {
+     const GgufProduct product{&w, &residual, 0, GgufEpilogue::Accumulate};

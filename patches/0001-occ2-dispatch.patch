@@ -1,0 +1,26 @@
+--- a/src/ops/linear/gguf/ggml_bridge.cu
++++ b/src/ops/linear/gguf/ggml_bridge.cu
+@@ -2,6 +2,7 @@
+ // activation quantizers follow ggml's q8_1, reading BF16 and optionally gathering the input columns.
+ 
+ #include "ggml_bridge_internal.cuh"
++#include "ggml_bridge_occ2.h"
+ 
+ #include "ggml-cuda/dequantize.cuh"
+ 
+@@ -986,8 +987,13 @@
+         NINFER_GGUF_MOE_MATRIX_CASE(IQ3_XXS);
+         NINFER_GGUF_MOE_MATRIX_CASE(IQ3_S);
+         NINFER_GGUF_MOE_MATRIX_CASE(IQ1_S);
+-        NINFER_GGUF_MOE_MATRIX_CASE(IQ4_NL);
+-        NINFER_GGUF_MOE_MATRIX_CASE(IQ4_XS);
++    case GgmlType::IQ4_NL:
++        if (detail::try_moe_iq4nl_sm110_occ2(table, routing, max_active, pairs, tail,
++                                             activation, out, stream)) return;
++        detail::moe_matrix_product_impl<GGML_TYPE_IQ4_NL>(table.experts, table.row_bytes,
++            table.rows, table.k, routing, max_active, pairs, tail, activation, out, stream);
++        return;
++        NINFER_GGUF_MOE_MATRIX_CASE(IQ4_XS);
+     case GgmlType::IQ1_M:
+         break;
+     }

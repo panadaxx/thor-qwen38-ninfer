@@ -1,0 +1,40 @@
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index 8976451e..f613fd88 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -27,3 +27,35 @@ set_tests_properties(${_ninfer_all_tests} PROPERTIES SKIP_RETURN_CODE 77 SKIP_RE
+ # there once so they resolve their imports (the Windows loader only searches the executable's own
+ # directory, the system directories and PATH).
+ ninfer_stage_test_runtime_dlls(ninfer_tests)
++
++# A small opt-in bundle for device qualification on memory-constrained Thor systems. These are
++# existing object-program targets, so this adds only a dispatcher executable and reuses the same
++# CUDA object code as ninfer_tests instead of building all unrelated test programs.
++option(NINFER_THOR_QUALIFICATION
++  "Build the focused GGUF/MoE/GDN/QSA qualification bundle" OFF)
++if(NINFER_THOR_QUALIFICATION)
++  set(_ninfer_thor_qualification_programs
++    ninfer_linear_gguf_test
++    ninfer_moe_experts_gguf_test
++    ninfer_gated_delta_net_test
++    ninfer_qsa_indexer_test
++    ninfer_ple_inject_test
++    ninfer_hyper_connection_test
++    ninfer_moe_route_test
++    ninfer_sparse_moe_test
++    ninfer_gguf_flash_attention_test
++    ninfer_sparse_attention_test)
++  foreach(_program IN LISTS _ninfer_thor_qualification_programs)
++    if(NOT TARGET ${_program})
++      message(FATAL_ERROR "Thor qualification bundle requires existing program ${_program}")
++    endif()
++    get_target_property(_program_type ${_program} TYPE)
++    if(NOT _program_type STREQUAL "OBJECT_LIBRARY")
++      message(FATAL_ERROR "Thor qualification program ${_program} must be an object library")
++    endif()
++  endforeach()
++  set_property(GLOBAL PROPERTY NINFER_BUNDLE_ninfer_thor_tests_PROGRAMS
++    ${_ninfer_thor_qualification_programs})
++  ninfer_finalize_bundle(ninfer_thor_tests)
++  ninfer_stage_runtime_dlls(ninfer_thor_tests)
++endif()

@@ -1,0 +1,117 @@
+--- a/src/runtime/engine/qwen4_exp_core.cpp
++++ b/src/runtime/engine/qwen4_exp_core.cpp
+@@ -37,6 +37,7 @@
+ #include <condition_variable>
+ #include <cstdio>
+ #include <cstring>
++#include <cstdlib>
+ #include <deque>
+ #include <fstream>
+ #include <iterator>
+@@ -267,8 +268,20 @@
+     executor.rope_yarn       = rope.yarn;
+     // A chunk also holds a verification of every sequence at once.
+     const std::uint32_t requested_chunk = options.prefill_chunk ? options.prefill_chunk : 1024;
+-    executor.prefill_chunk   = std::max(std::clamp<std::uint32_t>(requested_chunk, 64, 4096),
+-                                        (executor.draft_tokens + 1) * executor.sequences);
++    const char* prefill_8k_env = std::getenv("NINFER_QWEN4_PREFILL_8K");
++    const bool all_ranks_sm110 = [&] {
++        for (std::size_t rank = 0; rank < device.size(); ++rank) {
++            if (device.rank(rank).compute_capability() != 110) { return false; }
++        }
++        return true;
++    }();
++    const bool prefill_8k_opt_in = prefill_8k_env != nullptr &&
++                                   std::strcmp(prefill_8k_env, "1") == 0 && all_ranks_sm110;
++    const std::uint32_t chunk_limit = prefill_8k_opt_in ? 8192U : 4096U;
++    executor.allow_extended_prefill_chunk = prefill_8k_opt_in;
++    executor.prefill_chunk = std::max(
++        std::clamp<std::uint32_t>(requested_chunk, 64, chunk_limit),
++        (executor.draft_tokens + 1) * executor.sequences);
+     executor.ngram           = std::move(ngram);
+     executor.ngram_read      = std::move(ngram_read);
+     executor.expert_cache_bytes =
+@@ -318,12 +331,12 @@
+     }
+     publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                        "Qwen3.8-Flash-Next: %zu stage(s), experts in %s memory, n-gram table "
+-                       "%s, state %.0f MiB, workspace %.0f MiB, expert cache %.0f MiB",
++                       "%s, prefill chunk %u, state %.0f MiB, workspace %.0f MiB, expert cache %.0f MiB",
+                        model->stages().stages(),
+                        options.expert_residency == ExpertResidency::Host   ? "host"
+                        : options.expert_residency == ExpertResidency::Disk ? "the artifact's files"
+                                                                            : "device",
+-                       table_place.c_str(),
++                       table_place.c_str(), instance->executor->options().prefill_chunk,
+                        double(instance->executor->memory().state_bytes) / 1048576.0,
+                        double(instance->executor->memory().workspace_bytes) / 1048576.0,
+                        double(instance->executor->memory().expert_cache_bytes) / 1048576.0);
+--- a/src/models/qwen4_exp/executor.h
++++ b/src/models/qwen4_exp/executor.h
+@@ -43,6 +43,8 @@
+     std::uint32_t max_context = 32768;
+     // Tokens per forward call: a prompt is fed in calls of at most this many.
+     std::uint32_t prefill_chunk = 2048;
++    // Set only by the Qwen4 engine's explicit SM110 8K opt-in; otherwise the 4096 cap applies.
++    bool allow_extended_prefill_chunk = false;
+     std::uint32_t sequences     = 1;
+     // The n-gram table of the PLE layer. Empty runs the model without it: the PLE injection is
+     // skipped, which is what an all-zero table would give.
+--- a/src/models/qwen4_exp/executor.cpp
++++ b/src/models/qwen4_exp/executor.cpp
+@@ -740,9 +740,14 @@
+     Impl(const Model& m, DeviceContext& d, ExecutorOptions o)
+         : model(m), device(d), options(std::move(o)), config(m.config()),
+           ngram(derive_ngram_hash_constants(config.ngram)) {
+-        if (options.prefill_chunk == 0 || options.prefill_chunk > 4096 || options.sequences == 0 ||
++        const bool extended_chunk = options.allow_extended_prefill_chunk &&
++                                    options.prefill_chunk <= 8192 &&
++                                    device.compute_capability() == 110;
++        if (options.prefill_chunk == 0 ||
++            (options.prefill_chunk > 4096 && !extended_chunk) || options.sequences == 0 ||
+             options.max_context == 0) {
+-            throw std::invalid_argument("qwen4_exp executor: chunk must be in [1, 4096]");
++            throw std::invalid_argument(
++                "qwen4_exp executor: chunk must be in [1, 4096], or [4097, 8192] with the SM110 opt-in");
+         }
+         if (options.ngram) {
+             table = std::make_unique<NgramTableReader>(options.ngram->layout, options.ngram_read);
+--- a/src/ops/moe_experts/moe_experts_gguf.cu
++++ b/src/ops/moe_experts/moe_experts_gguf.cu
+@@ -18,5 +18,7 @@
+ 
+ #include <algorithm>
+ #include <cstdint>
++#include <cstdlib>
++#include <cstring>
+ #include <stdexcept>
+ #include <string>
+@@ -328,7 +329,17 @@
+ void check_stage_inputs(const Tensor& m, const Tensor& ids, const Tensor& weights) {
+     const std::int32_t tokens = m.ne[1];
+     require(tokens > 0 && shaped(m, DType::BF16, kHidden, tokens), "m must be BF16 [2560, tokens]");
+-    require(tokens * kTopK <= 65535, "at most 6553 tokens per call");
++    const char* prefill_8k_env = std::getenv("NINFER_QWEN4_PREFILL_8K");
++    int device = -1;
++    cudaDeviceProp properties{};
++    const bool scoped_sm110_8k = tokens <= 8192 && prefill_8k_env != nullptr &&
++                                 std::strcmp(prefill_8k_env, "1") == 0 &&
++                                 cudaGetDevice(&device) == cudaSuccess &&
++                                 cudaGetDeviceProperties(&properties, device) == cudaSuccess &&
++                                 properties.major == 11 && properties.minor == 0;
++    // Keep the historical cap except for the explicit, audited SM110 8K Qwen4 candidate.
++    require(std::int64_t(tokens) * kTopK <= 65535 || scoped_sm110_8k,
++            "at most 6553 tokens per call (SM110 8K opt-in permits at most 8192)");
+     require(shaped(ids, DType::I32, kTopK, tokens), "ids must be I32 [10, tokens]");
+     require(shaped(weights, DType::FP32, kTopK, tokens), "weights must be FP32 [10, tokens]");
+ }
+--- a/src/runtime/engine/engine.cpp
++++ b/src/runtime/engine/engine.cpp
+@@ -361,6 +361,7 @@
+         if (runtime::is_qwen4_exp_artifact(options.artifact_path)) {
+             auto constructed    = runtime::construct_qwen4_exp(options, device);
+             flash               = std::move(constructed.instance);
++            options.prefill_chunk = flash->executor->options().prefill_chunk;
+             load                = std::move(constructed.load);
+             load.cuda_sync_mode = device.sync_mode();
+             model_metadata      = std::move(constructed.model_metadata);

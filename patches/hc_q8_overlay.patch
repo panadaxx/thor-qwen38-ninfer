@@ -1,0 +1,329 @@
+--- a/src/models/qwen4_exp/model.cpp
++++ b/src/models/qwen4_exp/model.cpp
+@@ -7,6 +7,7 @@
+ #include "models/qwen3_5/load/bindings.h"
+ 
+ #include <algorithm>
++#include <cstdlib>
+ #include <numeric>
+ #include <set>
+ #include <stdexcept>
+@@ -319,9 +320,10 @@
+ 
+ Model::Model(TextConfig config, LoadOptions options, TextWeights weights, StagePlan stages,
+              std::vector<BoundWeight> bound, FrontendResources resources, InstanceInfo info,
+-             artifact::MaterializedArtifact backing)
++             artifact::MaterializedArtifact backing, std::shared_ptr<HcQ8Sidecar> hc_q8_sidecar)
+     : backing_(std::move(backing)), config_(std::move(config)), options_(std::move(options)),
+-      weights_(std::move(weights)), stages_(std::move(stages)), bound_(std::move(bound)),
++      weights_(std::move(weights)), stages_(std::move(stages)),
++      hc_q8_sidecar_(std::move(hc_q8_sidecar)), bound_(std::move(bound)),
+       resources_(std::move(resources)), info_(std::move(info)) {}
+ 
+ Model::~Model() = default;
+@@ -391,6 +393,8 @@
+         mtp_config = parse_mtp_config(reader.directory().component("mtp").config, config);
+     }
+     FrontendResources resources = bind_resources(binder, config, options.vision);
++    const char* hc_q8_path = std::getenv("NINFER_HC_Q8_SIDECAR");
++    const bool use_hc_q8_sidecar = hc_q8_path && *hc_q8_path;
+     Bindings b(binder);
+ 
+     TextWeights weights;
+@@ -487,9 +491,14 @@
+     auto materialization = std::move(binder).finish();
+     auto backing = artifact::materialize(reader, std::move(materialization), device, observer);
+     auto bound   = qwen3_5::loading::resolve_weights(std::move(pending), backing);
++    std::shared_ptr<HcQ8Sidecar> hc_q8_sidecar;
++    if (use_hc_q8_sidecar) {
++        hc_q8_sidecar = std::make_shared<HcQ8Sidecar>(std::filesystem::path(hc_q8_path), bound, device);
++    }
+     auto model           = std::unique_ptr<Model>(
+         new Model(std::move(config), options, std::move(weights), std::move(stages),
+-                  std::move(bound), std::move(resources), std::move(info), std::move(backing)));
++                  std::move(bound), std::move(resources), std::move(info), std::move(backing),
++                  std::move(hc_q8_sidecar)));
+     model->files_          = std::move(files);
+     model->replicas_       = qwen3_5::AuxiliaryReplicas(model->bound_, device);
+     model->vision_config_  = std::move(vision_config);
+--- a/src/models/qwen4_exp/model.h
++++ b/src/models/qwen4_exp/model.h
+@@ -16,6 +16,7 @@
+ #include "models/qwen3_5/model.h"
+ #include "models/qwen3_5/weights.h"
+ #include "models/qwen4_exp/config.h"
++#include "models/qwen4_exp/hc_q8_sidecar.h"
+ #include "models/qwen4_exp/expert_location.h"
+ #include "ninfer/ops/weight_input.h"
+ #include "ninfer/model_enums.h"
+@@ -172,14 +173,16 @@
+                                              DeviceContext&, const StartupObserver*);
+     Model(TextConfig config, LoadOptions options, TextWeights weights, StagePlan stages,
+           std::vector<BoundWeight> bound, FrontendResources resources, InstanceInfo info,
+-          artifact::MaterializedArtifact backing);
+-
+-    // Destroy every borrower before the backing.
++          artifact::MaterializedArtifact backing, std::shared_ptr<HcQ8Sidecar> hc_q8_sidecar);
++
++    // Destroy every borrower before its owning storage.
+     artifact::MaterializedArtifact backing_;
+     TextConfig config_;
+     LoadOptions options_;
+     TextWeights weights_;
+     StagePlan stages_;
++    // Declared before bound_: its device buffers and WeightParents back bound_ views.
++    std::shared_ptr<HcQ8Sidecar> hc_q8_sidecar_;
+     std::vector<BoundWeight> bound_;
+     FrontendResources resources_;
+     InstanceInfo info_;
+--- a/src/models/qwen4_exp/loading_sources.cmake
++++ b/src/models/qwen4_exp/loading_sources.cmake
+@@ -1,6 +1,7 @@
+ target_sources(ninfer_model_loading PRIVATE
+   "${CMAKE_CURRENT_LIST_DIR}/config.cpp"
+   "${CMAKE_CURRENT_LIST_DIR}/model.cpp"
++  "${CMAKE_CURRENT_LIST_DIR}/hc_q8_sidecar.cpp"
+   "${CMAKE_CURRENT_LIST_DIR}/ngram_component.cpp"
+   "${CMAKE_CURRENT_LIST_DIR}/ngram_hash.cpp"
+   "${CMAKE_CURRENT_LIST_DIR}/ngram_profile.cpp"
+--- /dev/null
++++ b/src/models/qwen4_exp/hc_q8_sidecar.h
+@@ -0,0 +1,32 @@
++// SPDX-License-Identifier: Apache-2.0
++#pragma once
++
++#include "core/device.h"
++#include "models/qwen3_5/weights.h"
++
++#include <filesystem>
++#include <memory>
++#include <vector>
++
++namespace ninfer::models::qwen4_exp {
++
++// Opt-in, model-owned Q8_0 replacements for the 290 text hyper-connection matrices.
++// The sidecar directory is produced by p4-hc-q8/hc_q8_sidecar.py.
++class HcQ8Sidecar {
++public:
++    HcQ8Sidecar(const std::filesystem::path& directory, std::vector<qwen3_5::BoundWeight>& bound,
++                DeviceContext& device);
++    ~HcQ8Sidecar();
++
++    HcQ8Sidecar(const HcQ8Sidecar&)            = delete;
++    HcQ8Sidecar& operator=(const HcQ8Sidecar&) = delete;
++    HcQ8Sidecar(HcQ8Sidecar&&) noexcept;
++    HcQ8Sidecar& operator=(HcQ8Sidecar&&) noexcept;
++
++private:
++    struct Entry;
++    // Heap entries keep WeightParent addresses stable for the lifetime of BoundWeight views.
++    std::vector<std::unique_ptr<Entry>> entries_;
++};
++
++} // namespace ninfer::models::qwen4_exp
+--- /dev/null
++++ b/src/models/qwen4_exp/hc_q8_sidecar.cpp
+@@ -0,0 +1,203 @@
++// SPDX-License-Identifier: Apache-2.0
++#include "models/qwen4_exp/hc_q8_sidecar.h"
++
++#include "artifact/schema.h"
++#include "core/arena.h"
++#include "core/weight_view.h"
++
++#include <nlohmann/json.hpp>
++
++#include <algorithm>
++#include <array>
++#include <charconv>
++#include <cstdio>
++#include <cstddef>
++#include <cstdint>
++#include <fstream>
++#include <limits>
++#include <map>
++#include <set>
++#include <stdexcept>
++#include <string>
++#include <string_view>
++#include <utility>
++
++namespace ninfer::models::qwen4_exp {
++namespace {
++
++using Json        = nlohmann::json;
++using BoundWeight = qwen3_5::BoundWeight;
++
++bool is_text_hc(std::string_view name) {
++    if (name == "text/final_mixer/down" || name == "text/final_mixer/up") { return true; }
++    constexpr std::string_view prefix = "text/layers/";
++    if (!name.starts_with(prefix)) { return false; }
++    const auto layer_end = name.find('/', prefix.size());
++    if (layer_end == std::string_view::npos) { return false; }
++    unsigned layer = 0;
++    const auto [end, error] =
++        std::from_chars(name.data() + prefix.size(), name.data() + layer_end, layer);
++    if (error != std::errc{} || end != name.data() + layer_end || layer >= 48) { return false; }
++    const auto suffix                                  = name.substr(layer_end);
++    constexpr std::array<std::string_view, 2> families = {"/attn_hc/", "/mlp_hc/"};
++    for (const auto family : families) {
++        if (!suffix.starts_with(family)) { continue; }
++        const auto field = suffix.substr(family.size());
++        return field == "down" || field == "up" || field == "inject";
++    }
++    return false;
++}
++
++artifact::Shape expected_hc_shape(std::string_view name) {
++    const auto field = name.substr(name.rfind('/') + 1);
++    if (field == "down") { return {320, 10240}; }
++    if (field == "up") { return {10240, 320}; }
++    if (field == "inject") { return {4, 10240}; }
++    throw artifact::ArtifactError(std::string(name) + ": unknown text HC matrix role");
++}
++
++std::uint64_t checked_q8_bytes(const artifact::Shape& shape, std::string_view name) {
++    if (shape.size() != 2 || shape[1] % 32 != 0) {
++        throw artifact::ArtifactError(std::string(name) +
++                                      ": Q8_0 sidecar shape must be [rows, K%32=0]");
++    }
++    const std::uint64_t blocks_per_row = shape[1] / 32;
++    if (blocks_per_row > std::numeric_limits<std::uint64_t>::max() / 34 / shape[0]) {
++        throw artifact::ArtifactError(std::string(name) + ": Q8_0 byte size overflows");
++    }
++    return shape[0] * blocks_per_row * 34;
++}
++
++} // namespace
++
++struct HcQ8Sidecar::Entry {
++    std::string name;
++    DeviceBuffer storage;
++    WeightParent parent;
++};
++
++HcQ8Sidecar::HcQ8Sidecar(const std::filesystem::path& directory, std::vector<BoundWeight>& bound,
++                         DeviceContext& device) {
++    const auto manifest_path = directory / "manifest.json";
++    std::ifstream manifest_file(manifest_path, std::ios::binary);
++    if (!manifest_file) {
++        throw artifact::ArtifactError("cannot open HC Q8 sidecar manifest: " +
++                                      manifest_path.string());
++    }
++    Json manifest;
++    try {
++        manifest_file >> manifest;
++    } catch (const std::exception& error) {
++        throw artifact::ArtifactError("invalid HC Q8 sidecar manifest: " +
++                                      std::string(error.what()));
++    }
++    if (manifest.value("version", 0) != 1 || manifest.value("format", "") != "gguf_q8_0" ||
++        manifest.value("layout", "") != "row_major" || manifest.value("block_elements", 0) != 32 ||
++        manifest.value("block_bytes", 0) != 34 || !manifest.contains("tensors") ||
++        !manifest.at("tensors").is_array()) {
++        throw artifact::ArtifactError("HC Q8 sidecar manifest has an unsupported format");
++    }
++
++    std::map<std::string, BoundWeight*> expected;
++    for (auto& weight : bound) {
++        if (is_text_hc(weight.name)) {
++            if (!expected.emplace(weight.name, &weight).second) {
++                throw artifact::ArtifactError("duplicate text HC weight: " + weight.name);
++            }
++        }
++    }
++    if (expected.size() != 290) {
++        throw artifact::ArtifactError("HC Q8 sidecar expects 290 text matrices, found " +
++                                      std::to_string(expected.size()));
++    }
++    if (manifest.at("tensor_count").get<std::size_t>() != expected.size() ||
++        manifest.at("tensors").size() != expected.size()) {
++        throw artifact::ArtifactError("HC Q8 sidecar tensor count does not match text model");
++    }
++
++    const std::string payload_name = manifest.at("payload").get<std::string>();
++    if (payload_name != "weights.q8_0") {
++        throw artifact::ArtifactError("HC Q8 sidecar payload must be weights.q8_0");
++    }
++    const auto payload_path = directory / payload_name;
++    std::ifstream payload(payload_path, std::ios::binary);
++    if (!payload) {
++        throw artifact::ArtifactError("cannot open HC Q8 payload: " + payload_path.string());
++    }
++    payload.seekg(0, std::ios::end);
++    const auto end = payload.tellg();
++    if (end < 0 ||
++        static_cast<std::uint64_t>(end) != manifest.at("payload_bytes").get<std::uint64_t>()) {
++        throw artifact::ArtifactError("HC Q8 payload length does not match manifest");
++    }
++
++    std::set<std::string> seen;
++    std::uint64_t expected_offset = 0;
++    entries_.reserve(expected.size());
++    for (const auto& item : manifest.at("tensors")) {
++        const std::string name = item.at("name").get<std::string>();
++        auto found             = expected.find(name);
++        if (found == expected.end() || !seen.insert(name).second) {
++            throw artifact::ArtifactError("unexpected or duplicate HC Q8 tensor: " + name);
++        }
++        BoundWeight& target = *found->second;
++        if (target.view.parts.empty() ||
++            std::any_of(target.view.parts.begin(), target.view.parts.end(), [](const auto& part) {
++                return !part.parent || part.parent->geometry.format != QType::BF16;
++            })) {
++            throw artifact::ArtifactError(name +
++                                          ": HC sidecar can overlay only BF16 source weights");
++        }
++        artifact::Shape shape;
++        for (const auto& dimension : item.at("shape")) {
++            shape.push_back(dimension.get<std::uint64_t>());
++        }
++        if (shape != target.view.shape || shape != expected_hc_shape(name)) {
++            throw artifact::ArtifactError(name +
++                                          ": sidecar shape differs from expected BF16 HC matrix");
++        }
++        const std::uint64_t offset = item.at("offset").get<std::uint64_t>();
++        const std::uint64_t bytes  = item.at("bytes").get<std::uint64_t>();
++        if (offset != expected_offset || bytes != checked_q8_bytes(shape, name)) {
++            throw artifact::ArtifactError(name + ": invalid Q8 payload offset or byte extent");
++        }
++        if (bytes > std::numeric_limits<std::size_t>::max()) {
++            throw artifact::ArtifactError(name + ": Q8 payload exceeds host address range");
++        }
++        std::vector<std::byte> host(static_cast<std::size_t>(bytes));
++        payload.clear();
++        payload.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
++        payload.read(reinterpret_cast<char*>(host.data()), static_cast<std::streamsize>(bytes));
++        if (payload.gcount() != static_cast<std::streamsize>(bytes)) {
++            throw artifact::ArtifactError(name + ": truncated Q8 payload");
++        }
++        auto entry  = std::make_unique<Entry>();
++        entry->name = name;
++        {
++            DeviceBinding device_binding(device.rank(target.rank).device);
++            entry->storage = DeviceBuffer(static_cast<std::size_t>(bytes));
++            entry->storage.copy_from_host(host.data(), host.size());
++        }
++        entry->parent.geometry = weight_geometry(QType::GGUF_Q8_0, QuantLayout::GgufBlocks, shape);
++        entry->parent.data     = static_cast<const std::byte*>(entry->storage.p);
++        entry->parent.weight_scale_divisor = 0.0F;
++        entry->parent.stored_format        = QType::GGUF_Q8_0;
++        target.view = WeightView{shape, {{&entry->parent, 0, entry->parent.geometry.elements}}};
++        entries_.push_back(std::move(entry));
++        expected_offset += bytes;
++    }
++    if (seen.size() != expected.size() ||
++        expected_offset != manifest.at("payload_bytes").get<std::uint64_t>() ||
++        expected_offset != 679608320) {
++        throw artifact::ArtifactError("HC Q8 sidecar is incomplete or has an unexpected extent");
++    }
++    std::fprintf(stderr,
++                 "NInfer HC Q8 sidecar active: %zu matrices, %llu bytes; BF16 backing retained\n",
++                 entries_.size(), static_cast<unsigned long long>(expected_offset));
++}
++
++HcQ8Sidecar::~HcQ8Sidecar()                                 = default;
++HcQ8Sidecar::HcQ8Sidecar(HcQ8Sidecar&&) noexcept            = default;
++HcQ8Sidecar& HcQ8Sidecar::operator=(HcQ8Sidecar&&) noexcept = default;
++
++} // namespace ninfer::models::qwen4_exp

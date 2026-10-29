@@ -1,0 +1,12 @@
+--- a/src/ops/linear/gguf/gguf_linear.cpp
++++ b/src/ops/linear/gguf/gguf_linear.cpp
+@@ -89,6 +89,9 @@
+         return false;
+     }
+     const bool supported_shape =
++        // Additional real model shapes passed same-input bitwise/FP64 and paired Thor gates.
++        (w.n == 512 && w.k == 2560) || (w.n == 640 && w.k == 2560) ||
++        (w.n == 12288 && w.k == 2560) ||
+         (w.n == 6144 && w.k == 2560) || (w.n == 10240 && w.k == 2560) ||
+         (w.n == 2560 && w.k == 6144) || (w.n == 2560 && w.k == 10240) ||
+         (w.n == 248320 && w.k == 2560 && tokens != 8);

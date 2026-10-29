@@ -1,0 +1,82 @@
+diff --git a/src/ops/linear/gguf/ggml_bridge.cu b/src/ops/linear/gguf/ggml_bridge.cu
+--- a/src/ops/linear/gguf/ggml_bridge.cu
++++ b/src/ops/linear/gguf/ggml_bridge.cu
+@@ -6,6 +6,9 @@
+ #include "ggml_bridge_iq2s_occ2.h"
+ #include "ggml_bridge_iq3_xxs_occ2.h"
+ #include "ggml_bridge_iq3_s_occ2.h"
++#if defined(NINFER_THOR_IQ4NL_ROWOWNED)
++#include "iq4nl_down_rowowned.cuh"
++#endif
+ #if defined(NINFER_THOR_IQ4NL_U_HIST)
+ #include "iq4nl_down_u_hist.cuh"
+ #endif
+@@ -16,6 +19,9 @@
+ 
+ #include <algorithm>
+ #include <array>
++#if defined(NINFER_THOR_IQ4NL_ROWOWNED)
++#include <atomic>
++#endif
+ #include <cstdarg>
+ #include <cstdio>
+ #include <cstdlib>
+@@ -722,6 +728,32 @@
+         (args.ids_b != nullptr && args.table_b == nullptr)) {
+         throw std::invalid_argument("gguf moe decode: invalid down arguments");
+     }
++#if defined(NINFER_THOR_IQ4NL_ROWOWNED)
++    // Cached opt-in; the default stays on the established production route. A non-matching
++    // device, shape, or incomplete host arguments falls through without synchronizing the stream.
++    static const bool rowowned_enabled = [] {
++        const char* value = std::getenv("NINFER_THOR_IQ4NL_ROWOWNED");
++        return value != nullptr && value[0] == '1' && value[1] == '\0';
++    }();
++    if (rowowned_enabled && type == GgmlType::IQ4_NL && args.rows == 2560 && args.tokens == 4 &&
++        args.slots == 40 && args.per_token == 10 && args.row_bytes == 360 && args.y == nullptr &&
++        args.records != nullptr && args.qs != nullptr && args.ds != nullptr && args.weights != nullptr &&
++        args.fixed != nullptr && args.middle != nullptr && args.table_a != nullptr &&
++        (args.ids_b == nullptr || args.table_b != nullptr)) {
++        const auto& facts = detail::device_facts();
++        if (facts.cc == 1100 && facts.sm_count == 14) {
++            // Confirm dispatch once without adding a log syscall to every decode call.
++            static std::atomic_flag rowowned_logged = ATOMIC_FLAG_INIT;
++            if (!rowowned_logged.test_and_set(std::memory_order_relaxed)) {
++                std::fprintf(stderr, "IQ4NL_ROWOWNED dispatch enabled: SM110/14SM IQ4_NL T4 2560x640\n");
++            }
++            // Launch validation / CUDA failures propagate from this function; they are never
++            // converted into a fallback after partially modifying the fixed-point output.
++            detail::vec::launch_iq4nl_down_rowowned_t4(args, stream);
++            return;
++        }
++    }
++#endif
+ #if defined(NINFER_THOR_IQ4NL_U_HIST)
+     if (type == GgmlType::IQ4_NL && detail::iq4nl_down_u_hist_enabled()) {
+         const auto& facts = detail::device_facts();
+diff --git a/src/ops/linear/gguf/sources.cmake b/src/ops/linear/gguf/sources.cmake
+--- a/src/ops/linear/gguf/sources.cmake
++++ b/src/ops/linear/gguf/sources.cmake
+@@ -103,3 +103,22 @@
+ 
+ # Opt-in same-body SM110 IQ3 J128 two-CTA implementations.
+ target_sources(ninfer_ggml_quants PRIVATE "${CMAKE_CURRENT_LIST_DIR}/ggml_mmq_iq3_xxs_occ2.cu" "${CMAKE_CURRENT_LIST_DIR}/ggml_mmq_iq3_s_occ2.cu")
++
++
++option(NINFER_ENABLE_THOR_IQ4NL_ROWOWNED "Compile opt-in IQ4_NL row-owned T4 candidate" OFF)
++set(NINFER_THOR_IQ4NL_ROWOWNED_DIR "" CACHE PATH "Path to the isolated IQ4_NL row-owned candidate")
++if(NINFER_ENABLE_THOR_IQ4NL_ROWOWNED)
++  if(NOT NINFER_ARCH_SM110_COMPAT)
++    message(FATAL_ERROR "IQ4NL row-owned candidate is restricted to the SM110 compatibility build")
++  endif()
++  if(NOT IS_DIRECTORY "${NINFER_THOR_IQ4NL_ROWOWNED_DIR}/src" OR
++     NOT IS_DIRECTORY "${NINFER_THOR_IQ4NL_ROWOWNED_DIR}/include")
++    message(FATAL_ERROR "NINFER_THOR_IQ4NL_ROWOWNED_DIR must contain src/ and include/")
++  endif()
++  set(_ninfer_iq4nl_rowowned_source "${NINFER_THOR_IQ4NL_ROWOWNED_DIR}/src/iq4nl_down_rowowned.cu")
++  target_sources(ninfer_ggml_quants PRIVATE "${_ninfer_iq4nl_rowowned_source}")
++  set_property(SOURCE "${CMAKE_CURRENT_LIST_DIR}/ggml_bridge.cu" "${_ninfer_iq4nl_rowowned_source}"
++    APPEND PROPERTY INCLUDE_DIRECTORIES "${NINFER_THOR_IQ4NL_ROWOWNED_DIR}/include;${PROJECT_SOURCE_DIR}/src")
++  set_property(SOURCE "${CMAKE_CURRENT_LIST_DIR}/ggml_bridge.cu"
++    APPEND PROPERTY COMPILE_DEFINITIONS NINFER_THOR_IQ4NL_ROWOWNED=1)
++endif()

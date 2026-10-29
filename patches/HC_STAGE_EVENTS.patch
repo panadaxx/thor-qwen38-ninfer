@@ -1,0 +1,185 @@
+diff --git a/src/ops/hyper_connection/hyper_connection.cu b/src/ops/hyper_connection/hyper_connection.cu
+--- a/src/ops/hyper_connection/hyper_connection.cu
++++ b/src/ops/hyper_connection/hyper_connection.cu
+@@ -24,7 +24,11 @@
+ #include <cublas_v2.h>
+ #include <cuda_bf16.h>
+ 
++#include <cuda_runtime.h>
++
+ #include <cstdint>
++#include <cstdio>
++#include <cstdlib>
+ #include <stdexcept>
+ #include <string>
+ 
+@@ -808,9 +812,122 @@
+ 
+ namespace {
+ 
+-void read(const Tensor& stack, const Tensor* y, const Tensor* previous_inject,
+-          const HyperConnectionWeights& weights, float eps, WorkspaceArena& workspace,
+-          Tensor& mixed, Tensor* inject_weights, cudaStream_t stream) {
++// Optional eager-only stage sampler. Each event pair brackets one read_impl call, so work
++// between distinct HC calls (for example MoE/attention) is excluded from the HC sum.
++class HcStageEventSampler {
++public:
++    ~HcStageEventSampler() {
++        if (start_ != nullptr) { (void)cudaEventDestroy(start_); }
++        if (stop_ != nullptr) { (void)cudaEventDestroy(stop_); }
++    }
++
++    [[nodiscard]] bool done() const noexcept { return emitted_ >= kMaxSamples || disabled_; }
++
++    void note_capture_skip() {
++        reset_group();
++        if (!capture_noted_) {
++            std::fprintf(stderr,
++                         "HC_STAGE sampling skipped: CUDA stream capture active; not counted\n");
++            capture_noted_ = true;
++        }
++    }
++
++    void note_unavailable(cudaError_t status, const char* action) {
++        disabled_ = true;
++        if (!error_noted_) {
++            std::fprintf(stderr, "HC_STAGE sampling unavailable: %s: %s\n", action,
++                         cudaGetErrorString(status));
++            error_noted_ = true;
++        }
++    }
++
++    bool begin(cudaStream_t stream) {
++        if (done() || !ensure_events()) { return false; }
++        const cudaError_t status = cudaEventRecord(start_, stream);
++        if (status != cudaSuccess) {
++            note_unavailable(status, "record start");
++            reset_group();
++            return false;
++        }
++        active_ = true;
++        return true;
++    }
++
++    void finish(cudaStream_t stream) {
++        if (!active_) { return; }
++        cudaError_t status = cudaEventRecord(stop_, stream);
++        if (status == cudaSuccess) { status = cudaEventSynchronize(stop_); }
++        float milliseconds = 0.0F;
++        if (status == cudaSuccess) { status = cudaEventElapsedTime(&milliseconds, start_, stop_); }
++        active_ = false;
++        if (status != cudaSuccess) {
++            note_unavailable(status, "complete per-read timing");
++            reset_group();
++            return;
++        }
++        sum_ms_ += milliseconds;
++        ++calls_;
++        if (calls_ == kReadsPerToken) {
++            ++token_;
++            if (token_ > kWarmupTokens && emitted_ < kMaxSamples) {
++                std::fprintf(stderr,
++                             "HC_STAGE token=%llu read_calls=%d gpu_ms=%.6f\n",
++                             static_cast<unsigned long long>(token_), kReadsPerToken, sum_ms_);
++                ++emitted_;
++            }
++            reset_group();
++        }
++    }
++
++    void abort() noexcept { reset_group(); }
++
++private:
++    static constexpr int kReadsPerToken = 97; // 48 layers * (attn + MLP) + final mixer
++    static constexpr int kWarmupTokens = 8;
++    static constexpr int kMaxSamples = 64;
++
++    bool ensure_events() {
++        if (start_ != nullptr && stop_ != nullptr) { return true; }
++        cudaError_t status = cudaEventCreate(&start_);
++        if (status == cudaSuccess) { status = cudaEventCreate(&stop_); }
++        if (status != cudaSuccess) {
++            if (start_ != nullptr) { (void)cudaEventDestroy(start_); start_ = nullptr; }
++            if (stop_ != nullptr) { (void)cudaEventDestroy(stop_); stop_ = nullptr; }
++            note_unavailable(status, "create events");
++            return false;
++        }
++        return true;
++    }
++
++    void reset_group() noexcept {
++        calls_ = 0;
++        sum_ms_ = 0.0F;
++        active_ = false;
++    }
++
++    cudaEvent_t start_ = nullptr;
++    cudaEvent_t stop_ = nullptr;
++    int calls_ = 0;
++    std::uint64_t token_ = 0;
++    int emitted_ = 0;
++    float sum_ms_ = 0.0F;
++    bool active_ = false;
++    bool capture_noted_ = false;
++    bool error_noted_ = false;
++    bool disabled_ = false;
++};
++
++bool hc_stage_events_enabled() {
++    static const bool enabled = [] {
++        const char* value = std::getenv("NINFER_HC_STAGE_EVENTS");
++        return value != nullptr && value[0] == '1' && value[1] == '\0';
++    }();
++    return enabled;
++}
++
++void read_impl(const Tensor& stack, const Tensor* y, const Tensor* previous_inject,
++               const HyperConnectionWeights& weights, float eps, WorkspaceArena& workspace,
++               Tensor& mixed, Tensor* inject_weights, cudaStream_t stream) {
+     require(stack.dtype == DType::FP32 && stack.is_contiguous() && stack.data != nullptr &&
+                 aligned16(stack.data) && stack.ne[0] == kHidden && stack.ne[1] == kStreams &&
+                 stack.ne[3] == 1,
+@@ -914,6 +1031,43 @@
+     }
+ }
+ 
++void read(const Tensor& stack, const Tensor* y, const Tensor* previous_inject,
++          const HyperConnectionWeights& weights, float eps, WorkspaceArena& workspace,
++          Tensor& mixed, Tensor* inject_weights, cudaStream_t stream) {
++    if (!hc_stage_events_enabled() || stack.ne[2] != 1) {
++        read_impl(stack, y, previous_inject, weights, eps, workspace, mixed, inject_weights, stream);
++        return;
++    }
++
++    static thread_local HcStageEventSampler sampler;
++    if (sampler.done()) {
++        read_impl(stack, y, previous_inject, weights, eps, workspace, mixed, inject_weights, stream);
++        return;
++    }
++    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
++    const cudaError_t capture_status = cudaStreamIsCapturing(stream, &capture);
++    if (capture_status != cudaSuccess) {
++        sampler.abort();
++        sampler.note_unavailable(capture_status, "query stream capture");
++        read_impl(stack, y, previous_inject, weights, eps, workspace, mixed, inject_weights, stream);
++        return;
++    }
++    if (capture != cudaStreamCaptureStatusNone) {
++        sampler.note_capture_skip();
++        read_impl(stack, y, previous_inject, weights, eps, workspace, mixed, inject_weights, stream);
++        return;
++    }
++
++    const bool timing = sampler.begin(stream);
++    try {
++        read_impl(stack, y, previous_inject, weights, eps, workspace, mixed, inject_weights, stream);
++    } catch (...) {
++        if (timing) { sampler.abort(); }
++        throw;
++    }
++    if (timing) { sampler.finish(stream); }
++}
++
+ } // namespace
+ 
+ void hyper_connection_read(const Tensor& stack, const HyperConnectionWeights& weights, float eps,

@@ -196,6 +196,12 @@ public/thor-qwen38-ninfer/
 
 `release/` 里的编译产物适合作为 GitHub Release 资产上传，不适合直接塞进普通 Git。大模型、N-gram 表、Sidecar 等大体积文件不会放进这个包。
 
+当前 Release：
+
+```text
+https://github.com/panadaxx/thor-qwen38-ninfer/releases/tag/v2026.10.29-thor-sm110a
+```
+
 ## 注意
 
 - 这个包不是生产部署。

@@ -1,5 +1,9 @@
 # Release 包说明
 
+当前 Release 页面：[v2026.10.29-thor-sm110a](https://github.com/panadaxx/thor-qwen38-ninfer/releases/tag/v2026.10.29-thor-sm110a)。
+
+当前编译产物：[`ninfer-multicall-thor-sm110a-stripped-20261029.tar.zst`](https://github.com/panadaxx/thor-qwen38-ninfer/releases/download/v2026.10.29-thor-sm110a/ninfer-multicall-thor-sm110a-stripped-20261029.tar.zst)。
+
 `ninfer-multicall-thor-sm110a-stripped-20261029.tar.zst` 是当前 Thor 上编译好的 NInfer 可执行文件。压缩后约 319 MB，适合作为 GitHub Release 资产上传；这个体积不适合直接放进普通 Git 历史。
 
 Release 资产的 SHA-256 在 [`ASSET_SHA256.txt`](ASSET_SHA256.txt)。

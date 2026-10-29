@@ -1,7 +1,7 @@
 df7e4e9551a9c3accf3cfb0939847196637991201e02ea3d187fec5d6760c80a  ./.gitignore
 c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4  ./LICENSE
 b7d7ab3004b5a49cbe27bc9bd8fb07122daa434493235df65f3d9081eabb6023  ./NOTICE.md
-bbe9511b09d28fa931067bdaaf0abc7ca2dae87a634480bf5ddec933193f77d2  ./README.md
+5c3f7f3cd718e25f86d49fdfcbb72decf4bd25b6638d3a5ce593eb4660515142  ./README.md
 86d6b441817013b80fe469c8ca73db46a7aab6b68ffd38e6ee1c2ad1245b5c6b  ./patches/0001-fa2-prefix-dispatch.patch
 bcef6f30bbeb926dd7a7424f6b88e936ebff17fda14de435518e7507b82a6fe7  ./patches/0001-fa2-sparse-qsa-dispatch.patch
 1cfea7a1fea2c61049ba9a5fd44314f5cf537e63cdd4a4fefc89fc2a4bcd5c80  ./patches/0001-hc-bf16-preserve.patch
@@ -36,5 +36,5 @@ ff549af478593006d92e7abeb4401e3cc7451990e128381882204e2187e7fc4b  ./patches/q6k-
 22559191d48a27c8c6653712a4bbd41a63477205cee4d1f83594b28789ae7a73  ./patches/qwen4-mtp-phase-profile.patch
 ab1f5d3ae32fd7cfbf8b440eeffa015d1d669d80620d337dedf11aa359c9fe38  ./patches/qwen4-prefill-8192.patch
 d0730c6bdf195df4704c8f7b4fd5fdf62b260e99c3a4acda00d4553b9ae27613  ./release/ASSET_SHA256.txt
-c42c28fd7e8b7f531e610f394414314aec3b26359440e191fb5565552e24739e  ./release/README.md
+49e567f897a724ceb14e50f39da6f0aedb95bff0724c27f014c9dc12d0d54c18  ./release/README.md
 05d44577f80b5f4ddab522aaa4725ed8742f24160c6ff904ea3570d78fbc606a  ./scripts/start-thor-3.8fl-512k.sh
